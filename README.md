@@ -50,6 +50,10 @@ git clone https://github.com/adnw-vinc/hermes-nextcloud.git nextcloud
 
 Alternatively, copy the `nextcloud/` directory into your skills folder manually.
 
+If Hermes Agent is running inside a container:
+
+Add `HERMES\_HOME="/opt/data"` environment variable to your container.
+
 ## Setup
 
 Run the guided setup:

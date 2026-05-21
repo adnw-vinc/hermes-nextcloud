@@ -19,16 +19,18 @@ Requires: **Nextcloud Notes app** installed on the instance (for Notes features)
 
 ## Setup
 
+Locate the Skill in $HERMES\_HOME or ~/.hermes
+
 Run the guided setup to configure credentials:
 
 ```bash
-python3 ~/.hermes/skills/productivity/nextcloud/scripts/setup.py
+python3 $HERMES_HOME/skills/productivity/nextcloud/scripts/setup.py
 ```
 
 The setup script will:
 1. Ask for your Nextcloud URL, username, and App Password
 2. Validate connectivity against your instance
-3. Save credentials to `~/.hermes/nextcloud.env`
+3. Save credentials to `$HERMES_HOME/nextcloud.env` or `~/.hermes/nextcloud.env`
 
 Alternatively, set environment variables manually:
 
@@ -50,7 +52,7 @@ export NEXTCLOUD_TIMEZONE="Europe/Prague"  # optional, defaults to UTC
 ### Verifying the Setup
 
 ```bash
-NC="python3 ~/.hermes/skills/productivity/nextcloud/scripts/nextcloud_api.py"
+NC="python3 $HERMES_HOME/skills/productivity/nextcloud/scripts/nextcloud_api.py"
 $NC check
 ```
 
@@ -73,7 +75,7 @@ Authentication: HTTP Basic Auth with App Password (`user:token`).
 Define the convenience alias:
 
 ```bash
-NC="python3 ~/.hermes/skills/productivity/nextcloud/scripts/nextcloud_api.py"
+NC="python3 $HERMES_HOME/skills/productivity/nextcloud/scripts/nextcloud_api.py"
 ```
 
 ---

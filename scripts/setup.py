@@ -10,7 +10,8 @@ import os
 import subprocess
 import sys
 
-ENV_FILE = os.path.expanduser("~/.hermes/nextcloud.env")
+HERMES_HOME = os.environ.get("HERMES_HOME", "~/.hermes")
+ENV_FILE = os.path.expanduser(f'{HERMES_HOME}/nextcloud.env')
 
 
 def load_env():
