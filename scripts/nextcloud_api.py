@@ -15,6 +15,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Config
@@ -380,15 +381,33 @@ def parse_icalendar(text, item_type="VEVENT"):
             # Also try with parameters (e.g., DTSTART;TZID=Europe/Prague:...)
             if line.startswith(f"{field_name};") and ':' in line:
                 return line.split(':', 1)[1].strip()
-        return None
+        return ""
 
-    result["uid"] = get_field(block, "UID") or ""
-    result["summary"] = get_field(block, "SUMMARY") or ""
-    result["start"] = get_field(block, "DTSTART") or ""
-    result["end"] = get_field(block, "DTEND") or ""
-    result["due"] = get_field(block, "DUE") or ""
-    result["location"] = get_field(block, "LOCATION") or ""
-    result["description"] = get_field(block, "DESCRIPTION") or ""
+    def get_date_field(block_text, field_name):
+        for line in block_text.split('\n'):
+            if line.startswith(f"{field_name}:") or line.startswith(f"{field_name};") and ':' in line:
+                prefix, value = line.split(':', 1)
+                value = value.strip()
+                tzid = None
+                if ";TZID=" in prefix:
+                    # Isolates 'Europe/Prague' out of 'DTSTART;TZID=Europe/Prague'
+                    tzid = prefix.split(";TZID=")[1].split(";")[0]
+                if value.endswith("Z"):
+                    dt = datetime.fromisoformat(value)
+                elif tzid:
+                    dt = datetime.fromisoformat(value).astimezone(ZoneInfo(tzid))
+                else:
+                    dt = datetime.fromisoformat(value)
+                return dt.isoformat()
+        return ""
+
+    result["uid"] = get_field(block, "UID")
+    result["summary"] = get_field(block, "SUMMARY")
+    result["start"] = get_date_field(block, "DTSTART")
+    result["end"] = get_date_field(block, "DTEND")
+    result["due"] = get_date_field(block, "DUE")
+    result["location"] = get_field(block, "LOCATION")
+    result["description"] = get_field(block, "DESCRIPTION")
 
     pri = get_field(block, "PRIORITY")
     if pri:
