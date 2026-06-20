@@ -1184,8 +1184,96 @@ def cmd_addressbooks_list(env):
     return {"status": "success", "data": formatted}
 
 
-def cmd_contacts_list(env, addressbook=None):
-    """List contacts from an address book using PROPFIND + GET (REPORT not supported)."""
+def _report_addressbook(env, ab_href, filter_xml=""):
+    """Send a CardDAV addressbook-query REPORT against an address book collection.
+    Returns a list of {"href": ..., "vcard": ...} dicts, or {"error": ...} on failure.
+    filter_xml: optional <c:filter>...</c:filter> body to push filtering to the server.
+    """
+    base_url = env["NEXTCLOUD_URL"].rstrip("/")
+    ab_url = base_url + ab_href.rstrip("/") + "/"
+
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<c:addressbook-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">\n'
+        '  <d:prop>\n'
+        '    <d:getetag/>\n'
+        '    <c:address-data/>\n'
+        '  </d:prop>\n'
+        f'{filter_xml}\n'
+        '</c:addressbook-query>'
+    )
+
+    args = curl_xml(env) + [
+        "-X", "REPORT",
+        "-H", "Depth: 1",
+        "-H", "Content-Type: application/xml; charset=utf-8",
+        "--data-binary", body,
+        ab_url,
+    ]
+    output = run_curl(args)
+    if isinstance(output, dict) and "error" in output:
+        return output
+
+    # Extract each <d:response> block, then pull href and <c|card:address-data> contents.
+    contacts = []
+    response_blocks = re.findall(r"<d:response[^>]*>(.*?)</d:response>", output, re.DOTALL)
+    if not response_blocks:
+        response_blocks = re.findall(r"<response[^>]*>(.*?)</response>", output, re.DOTALL)
+
+    import html as _html
+    for block in response_blocks:
+        href_match = re.search(r"<d:href>([^<]+)</d:href>", block) or re.search(r"<href>([^<]+)</href>", block)
+        href = href_match.group(1).strip() if href_match else ""
+
+        # Accept either c:address-data or card:address-data (Nextcloud uses card:).
+        ad_match = re.search(r"<(?:c|card):address-data[^>]*>(.*?)</(?:c|card):address-data>", block, re.DOTALL)
+        if not ad_match:
+            continue
+        vcard_data = _html.unescape(ad_match.group(1)).strip()
+        if vcard_data:
+            contacts.append({"href": href, "vcard": vcard_data})
+
+    return contacts
+
+
+def _parse_vcard(vcard_data):
+    """Parse a vCard string into a contact dict.
+    Handles parameter-bearing properties like FN;X-NC-SCOPE=...:value.
+    """
+    contact = {}
+
+    fn_match = re.search(r"^FN(?:;[^:]*)*:(.+)$", vcard_data, re.MULTILINE)
+    if fn_match:
+        contact["fullname"] = fn_match.group(1).strip()
+
+    n_match = re.search(r"^N(?:;[^:]*)*:([^;]*);([^;]*);([^;]*);([^;]*);([^;]*)$", vcard_data, re.MULTILINE)
+    if n_match:
+        contact["name"] = f"{n_match.group(2).strip()};{n_match.group(1).strip()}"
+
+    emails = re.findall(r"^EMAIL(?:;[^:]*)*:([^\r\n]+)", vcard_data, re.MULTILINE)
+    if emails:
+        contact["emails"] = [e.strip() for e in emails if e.strip()]
+
+    phones = re.findall(r"^TEL(?:;[^:]*)*:([^\r\n]+)", vcard_data, re.MULTILINE)
+    if phones:
+        contact["phones"] = [p.strip() for p in phones if p.strip()]
+
+    for field, key in (("ORG", "organization"), ("TITLE", "title"), ("NOTE", "note")):
+        m = re.search(rf"^{field}(?:;[^:]*)?:(.+)$", vcard_data, re.MULTILINE)
+        if m:
+            contact[key] = m.group(1).strip()
+
+    uid_match = re.search(r"^UID:([^\r\n]+)", vcard_data, re.MULTILINE)
+    if uid_match:
+        contact["uid"] = uid_match.group(1).strip()
+
+    return contact
+
+
+def cmd_contacts_list(env, addressbook=None, name_prefix=None, has_organization=False):
+    """List contacts via CardDAV REPORT (single request, inline vCards).
+    Server-side filters: name_prefix (FN starts-with), has_organization (ORG present).
+    """
     if addressbook:
         abooks = [{"href": addressbook if addressbook.startswith("/") else carddav_url(env, addressbook + "/"), "name": addressbook}]
     else:
@@ -1194,75 +1282,36 @@ def cmd_contacts_list(env, addressbook=None):
             return ab_result
         abooks = ab_result.get("data", [])
 
+    filter_parts = []
+    if name_prefix:
+        safe = name_prefix.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+        filter_parts.append(
+            '  <c:prop-filter name="FN">\n'
+            f'    <c:text-match collation="i;unicode-casemap" match-type="starts-with">{safe}</c:text-match>\n'
+            '  </c:prop-filter>'
+        )
+    if has_organization:
+        filter_parts.append('  <c:prop-filter name="ORG"/>')
+
+    filter_xml = ("<c:filter>\n" + "\n".join(filter_parts) + "\n</c:filter>") if filter_parts else ""
+
     all_contacts = []
     for ab_entry in abooks:
         ab_href = ab_entry["href"]
-        base_url = env["NEXTCLOUD_URL"].rstrip("/")
-        ab_url = base_url + ab_href
+        result = _report_addressbook(env, ab_href, filter_xml=filter_xml)
+        if isinstance(result, dict) and "error" in result:
+            return result
 
-        # Try Depth: 1 first, fall back to infinity if no vcf files found
-        vcard_hrefs = []
-        for depth in ("1", "infinity"):
-            args = curl_xml(env) + [
-                "-X", "PROPFIND",
-                "-H", f"Depth: {depth}",
-                ab_url,
-            ]
-            output = run_curl(args)
-            if isinstance(output, dict) and "error" in output:
-                break
-            # Match vcf hrefs - .vcf files or Database: prefixed vcf files
-            vcard_hrefs = re.findall(r"<d:href>([^<]*(?:\.vcf|Database:[^<]*\.vcf)[^<]*)</d:href>", output)
-            # Filter out the addressbook root itself
-            vcard_hrefs = [h for h in vcard_hrefs if not h.rstrip("/").endswith(ab_href.rstrip("/"))]
-            if vcard_hrefs:
-                break
-
-        for vcard_href in vcard_hrefs:
-            # URL decode then re-encode to handle special chars like Database: prefix
-            decoded = urllib.parse.unquote(vcard_href)
-            encoded = urllib.parse.quote(decoded, safe="/:")
-            vcard_url = base_url + encoded
-            get_args = curl_basic(env) + [
-                "-X", "GET",
-                "-H", "Accept: text/vcard, text/x-vcard",
-                vcard_url,
-            ]
-            vcard_data = run_curl(get_args)
-            if isinstance(vcard_data, dict) or not vcard_data:
+        for entry in result:
+            vcard_data = entry.get("vcard", "")
+            if "BEGIN:VCARD" not in vcard_data:
                 continue
-
-            # Parse vCard - fields may have parameters like FN;X-NC-SCOPE=...:value
-            contact = {"addressbook": ab_entry.get("name", ab_href)}
-            # FN may have params like FN;X-NC-SCOPE=...:value - extract value after last :
-            fn_match = re.search(r"^FN(?:;[^:]*)*:(.+)$", vcard_data, re.MULTILINE)
-            if fn_match:
-                contact["fullname"] = fn_match.group(1).strip()
-            n_match = re.search(r"^N(?:;[^:]*)*:([^;]+);([^;]*);([^;]*);([^;]*);([^;]*)$", vcard_data, re.MULTILINE)
-            if n_match:
-                contact["name"] = f"{n_match.group(2)};{n_match.group(1)}"
-            emails = re.findall(r"^EMAIL(?:;[^:]*)*:([^\r\n]+)", vcard_data, re.MULTILINE)
-            if emails:
-                contact["emails"] = [e.strip() for e in emails if e.strip()]
-            phones = re.findall(r"^TEL(?:;[^:]*)*:([^\r\n]+)", vcard_data, re.MULTILINE)
-            if phones:
-                contact["phones"] = [p.strip() for p in phones if p.strip()]
-            org_match = re.search(r"^ORG:[^\r\n]+", vcard_data, re.MULTILINE)
-            if org_match:
-                contact["organization"] = org_match.group(1).strip()
-            title_match = re.search(r"^TITLE:[^\r\n]+", vcard_data, re.MULTILINE)
-            if title_match:
-                contact["title"] = title_match.group(1).strip()
-            note_match = re.search(r"^NOTE:[^\r\n]+", vcard_data, re.MULTILINE)
-            if note_match:
-                contact["note"] = note_match.group(1).strip()
-            uid_match = re.search(r"^UID:[^\r\n]+", vcard_data, re.MULTILINE)
-            if uid_match:
-                contact["uid"] = uid_match.group(0)[4:].strip()  # strip "UID:" (4 chars)
+            contact = _parse_vcard(vcard_data)
+            contact["addressbook"] = ab_entry.get("name", ab_href)
+            contact["href"] = entry.get("href", "")
             if contact.get("fullname"):
                 all_contacts.append(contact)
 
-    # Deduplicate by uid
     seen_uids = set()
     unique_contacts = []
     for contact in all_contacts:
@@ -1275,7 +1324,9 @@ def cmd_contacts_list(env, addressbook=None):
 
 
 def cmd_contacts_search(env, query):
-    """Search contacts by name or other fields."""
+    """Search contacts by name, organization, or email (substring match).
+    Uses the fast REPORT-based cmd_contacts_list and filters client-side.
+    """
     result = cmd_contacts_list(env)
     if result.get("status") != "success":
         return result
@@ -1290,9 +1341,7 @@ def cmd_contacts_search(env, query):
 
 
 def cmd_contacts_get(env, uid, addressbook=None):
-    """Get a single contact by UID.
-    Optimized: tries direct .vcf URL first, then falls back to PROPFIND scan.
-    """
+    """Get a single contact by UID using CardDAV REPORT with a UID text-match filter."""
     if addressbook:
         ab_result = cmd_addressbooks_list(env)
         if ab_result.get("status") != "success":
@@ -1308,91 +1357,28 @@ def cmd_contacts_get(env, uid, addressbook=None):
             return ab_result
         abooks = [(a["href"], a["name"]) for a in ab_result.get("data", [])]
 
-    base_url = env["NEXTCLOUD_URL"].rstrip("/")
+    safe_uid = uid.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    filter_xml = (
+        "<c:filter>\n"
+        '  <c:prop-filter name="UID">\n'
+        f'    <c:text-match collation="i;unicode-casemap">{safe_uid}</c:text-match>\n'
+        '  </c:prop-filter>\n'
+        "</c:filter>"
+    )
 
     for ab_href, ab_name in abooks:
-        # Optimized: try direct URL first (Nextcloud stores contacts as {uid}.vcf)
-        direct_url = base_url + ab_href.rstrip("/") + "/" + urllib.parse.quote(uid) + ".vcf"
-        get_args = curl_basic(env) + ["-X", "GET", "-H", "Accept: text/vcard", direct_url]
-        vcard_data = run_curl(get_args)
-        if not isinstance(vcard_data, dict) and vcard_data and "BEGIN:VCARD" in vcard_data:
-            # Found via direct URL - parse and return
-            contact = {
-                "addressbook": ab_name,
-                "addressbook_href": ab_href,
-                "uid": uid,
-            }
-            fn_match = re.search(r"^FN(?:;[^:]*)*:(.+)$", vcard_data, re.MULTILINE)
-            if fn_match:
-                contact["fullname"] = fn_match.group(1).strip()
-            emails = re.findall(r"^EMAIL(?:;[^:]*)*:([^\r\n]+)", vcard_data, re.MULTILINE)
-            if emails:
-                contact["emails"] = [e.strip() for e in emails]
-            phones = re.findall(r"^TEL(?:;[^:]*)*:([^\r\n]+)", vcard_data, re.MULTILINE)
-            if phones:
-                contact["phones"] = [p.strip() for p in phones]
-            org_match = re.search(r"^ORG:[^\r\n]+", vcard_data, re.MULTILINE)
-            if org_match:
-                contact["organization"] = org_match.group(1).strip()
-            title_match = re.search(r"^TITLE:[^\r\n]+", vcard_data, re.MULTILINE)
-            if title_match:
-                contact["title"] = title_match.group(1).strip()
-            note_match = re.search(r"^NOTE:[^\r\n]+", vcard_data, re.MULTILINE)
-            if note_match:
-                contact["note"] = note_match.group(1).strip()
-            return {"status": "success", "data": contact}
-
-        # Fallback: scan all vcf files via PROPFIND
-        ab_url = base_url + ab_href
-        for depth in ("1", "infinity"):
-            args = curl_xml(env) + ["-X", "PROPFIND", "-H", f"Depth: {depth}", ab_url]
-            output = run_curl(args)
-            if isinstance(output, dict) and "error" in output:
-                break
-
-            vcard_hrefs = re.findall(r"<d:href>([^<]*(?:\.vcf|Database:[^<]*\.vcf)[^<]*)</d:href>", output)
-            vcard_hrefs = [h for h in vcard_hrefs if not h.rstrip("/").endswith(ab_href.rstrip("/"))]
-            if vcard_hrefs:
-                break
-
-        for vcard_href in vcard_hrefs:
-            decoded = urllib.parse.unquote(vcard_href)
-            encoded = urllib.parse.quote(decoded, safe="/:")
-            vcard_url = base_url + encoded
-            get_args = curl_basic(env) + ["-X", "GET", "-H", "Accept: text/vcard", vcard_url]
-            vcard_data = run_curl(get_args)
-            if isinstance(vcard_data, dict) or not vcard_data or "BEGIN:VCARD" not in vcard_data:
-                continue
-            uid_match = re.search(r"^UID:([^\r\n]+)", vcard_data, re.MULTILINE)
-            file_uid = uid_match.group(1).strip() if uid_match else ""
-            if file_uid != uid:
-                continue
-            contact = {
-                "addressbook": ab_name,
-                "addressbook_href": ab_href,
-                "uid": file_uid,
-                "vcard_href": vcard_href,
-                "vcard_url": vcard_url,
-            }
-            fn_match = re.search(r"^FN(?:;[^:]*)*:(.+)$", vcard_data, re.MULTILINE)
-            if fn_match:
-                contact["fullname"] = fn_match.group(1).strip()
-            emails = re.findall(r"^EMAIL(?:;[^:]*)*:([^\r\n]+)", vcard_data, re.MULTILINE)
-            if emails:
-                contact["emails"] = [e.strip() for e in emails]
-            phones = re.findall(r"^TEL(?:;[^:]*)*:([^\r\n]+)", vcard_data, re.MULTILINE)
-            if phones:
-                contact["phones"] = [p.strip() for p in phones]
-            org_match = re.search(r"^ORG:[^\r\n]+", vcard_data, re.MULTILINE)
-            if org_match:
-                contact["organization"] = org_match.group(1).strip()
-            title_match = re.search(r"^TITLE:[^\r\n]+", vcard_data, re.MULTILINE)
-            if title_match:
-                contact["title"] = title_match.group(1).strip()
-            note_match = re.search(r"^NOTE:[^\r\n]+", vcard_data, re.MULTILINE)
-            if note_match:
-                contact["note"] = note_match.group(1).strip()
-            return {"status": "success", "data": contact}
+        result = _report_addressbook(env, ab_href, filter_xml=filter_xml)
+        if isinstance(result, dict) and "error" in result:
+            continue
+        if result:
+            entry = result[0]
+            vcard_data = entry.get("vcard", "")
+            if "BEGIN:VCARD" in vcard_data:
+                contact = _parse_vcard(vcard_data)
+                contact["addressbook"] = ab_name
+                contact["addressbook_href"] = ab_href
+                contact["href"] = entry.get("href", "")
+                return {"status": "success", "data": contact}
 
     return {"status": "error", "message": f"Contact '{uid}' not found"}
 
@@ -1646,7 +1632,9 @@ def main():
 
     p = contacts_sub.add_parser("list", help="List contacts")
     p.add_argument("--addressbook", default=None)
-    p.set_defaults(func=lambda args: cmd_contacts_list(env, args.addressbook))
+    p.add_argument("--prefix", default=None, help="Filter by full-name prefix (server-side)")
+    p.add_argument("--has-organization", action="store_true", help="Only show contacts with an organization (server-side)")
+    p.set_defaults(func=lambda args: cmd_contacts_list(env, args.addressbook, name_prefix=args.prefix, has_organization=args.has_organization))
 
     p = contacts_sub.add_parser("search", help="Search contacts")
     p.add_argument("--query", required=True)
