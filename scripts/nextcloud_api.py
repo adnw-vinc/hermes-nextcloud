@@ -13,7 +13,7 @@ import sys
 import textwrap
 import urllib.parse
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -91,6 +91,24 @@ def caldav_url(env, path=""):
     user = env["NEXTCLOUD_USER"]
     path = path.lstrip("/")
     return f"{base}/remote.php/dav/calendars/{user}/{path}"
+
+
+def caldav_event_url(env, calendars, cal_name, uid):
+    """Build the URL of a single event/task .ics under the given calendar.
+
+    Uses the calendar entry's href (URL path segment) rather than its display
+    name. In Nextcloud these differ whenever the displayname contains non-ASCII
+    characters ('Persönlich' -> 'personal') or when the calendar was shared by
+    another user ('Personal (Thomas Schneider)' -> 'personal_shared_by_thomas').
+
+    Returns None when cal_name is not present in calendars.
+    """
+    entry = next((c for c in calendars if c.get("name") == cal_name), None)
+    if not entry:
+        return None
+    base = env["NEXTCLOUD_URL"].rstrip("/")
+    href = entry.get("href", "").rstrip("/")
+    return f"{base}{href}/{uid}.ics"
 
 
 def carddav_url(env, path=""):
@@ -751,16 +769,19 @@ def cmd_tasks_create(env, title, calendar=None, due=None, priority=None, descrip
         cal_name = calendars[0]["name"]
 
     vtodo_body, uid = vtodo_from_args(title, due=due, priority=priority, description=description)
-    cal_url = caldav_url(env, f"{cal_name}/{uid}.ics")
+    cal_url = caldav_event_url(env, calendars, cal_name, uid)
+    if not cal_url:
+        return {"status": "error", "message": f"Calendar '{cal_name}' not found"}
 
     args = curl_basic(env) + [
+        "--fail",
         "-X", "PUT",
         "-H", "Content-Type: text/calendar; charset=utf-8",
         "-d", vtodo_body,
         cal_url,
     ]
     result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode in (0, 201, 204):
+    if result.returncode == 0:
         return {"status": "success", "data": {"uid": uid, "calendar": cal_name, "summary": title, "created": True}}
     return {"status": "error", "message": result.stderr or f"Create task failed (code {result.returncode})"}
 
@@ -846,15 +867,18 @@ def cmd_tasks_edit(env, uid, calendar=None, title=None, due=None, priority=None,
     # Preserve original UID
     new_body = new_body.replace(f"UID:{uid}", f"UID:{uid}", 1)
 
-    cal_url = caldav_url(env, f"{found_cal}/{uid}.ics")
+    cal_url = caldav_event_url(env, calendars, found_cal, uid)
+    if not cal_url:
+        return {"status": "error", "message": f"Calendar '{found_cal}' not found"}
     args = curl_basic(env) + [
+        "--fail",
         "-X", "PUT",
         "-H", "Content-Type: text/calendar; charset=utf-8",
         "-d", new_body,
         cal_url,
     ]
     result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode in (0, 201, 204):
+    if result.returncode == 0:
         return {"status": "success", "data": {**task_data, "updated": True}}
     return {"status": "error", "message": result.stderr or f"Edit task failed (code {result.returncode})"}
 
@@ -918,15 +942,18 @@ def cmd_tasks_complete(env, uid, calendar=None):
     )
     new_body = new_body.replace(f"UID:{uid}", f"UID:{uid}", 1)
 
-    cal_url = caldav_url(env, f"{found_cal}/{uid}.ics")
+    cal_url = caldav_event_url(env, calendars, found_cal, uid)
+    if not cal_url:
+        return {"status": "error", "message": f"Calendar '{found_cal}' not found"}
     args = curl_basic(env) + [
+        "--fail",
         "-X", "PUT",
         "-H", "Content-Type: text/calendar; charset=utf-8",
         "-d", new_body,
         cal_url,
     ]
     result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode in (0, 201, 204):
+    if result.returncode == 0:
         return {"status": "success", "data": {**task_data, "status": "COMPLETED", "updated": True}}
     return {"status": "error", "message": result.stderr or f"Complete task failed (code {result.returncode})"}
 
@@ -941,16 +968,33 @@ def cmd_tasks_delete(env, uid, calendar=None):
     search_cals = [calendar] if calendar else [c["name"] for c in calendars]
 
     for cal_name in search_cals:
-        cal_url = caldav_url(env, f"{cal_name}/{uid}.ics")
-        args = curl_basic(env) + ["-X", "DELETE", cal_url]
+        cal_url = caldav_event_url(env, calendars, cal_name, uid)
+        if not cal_url:
+            continue
+        args = curl_basic(env) + ["--fail", "-X", "DELETE", cal_url]
         result = subprocess.run(args, capture_output=True, text=True)
-        if result.returncode in (0, 204):
+        if result.returncode == 0:
             return {"status": "success", "data": {"uid": uid, "deleted": True}}
     return {"status": "error", "message": f"Task '{uid}' not found in any calendar"}
 
 
 def cmd_calendar_list(env, calendar=None, cal_from=None, cal_to=None):
-    """List calendar events (VEVENT) using PROPFIND + GET since REPORT is not supported."""
+    """List calendar events, expanding recurrences server-side.
+
+    Uses CalDAV REPORT with calendar-query + time-range + expand
+    (RFC 4791 § 9.6.5 / § 9.9). Two consequences:
+
+    1. Server-side time-range filter: one request per calendar, ~250 ms even
+       for a shared calendar with 140+ events. The old PROPFIND+GET-per-file
+       path took ~15–50 s for the same set.
+    2. Server-side expansion of RRULE/RDATE/EXDATE into concrete instances
+       within the window. Weekly meetings, contact birthdays, monthly
+       reminders now show up on every occurrence, not just the master.
+
+    When --from / --to are omitted, defaults are 30 days back / 365 days
+    forward. Real callers (briefing cron, "what's on my calendar today?")
+    always pass an explicit range anyway.
+    """
     calendars_result = cmd_calendars_list(env, cal_type="events")
     if calendars_result.get("status") != "success" or not calendars_result.get("data"):
         return {"status": "error", "message": "No calendars found"}
@@ -960,66 +1004,131 @@ def cmd_calendar_list(env, calendar=None, cal_from=None, cal_to=None):
         calendars = [c for c in calendars if c.get("name") == calendar]
         if not calendars:
             return {"status": "error", "message": f"Calendar '{calendar}' not found"}
+    # Skip protocol dirs (inbox/outbox/trashbin) that appear in the calendar-home
+    calendars = [c for c in calendars if c.get("name")]
+
+    # Build UTC time-range. Pad each side by a day so timezone slop
+    # (Europe/Berlin queries against UTC server) does not clip edge events.
+    # The client-side overlap filter at the end tightens back to the caller's
+    # requested window.
+    now = datetime.now(timezone.utc)
+    from_dt = _parse_range_bound(cal_from, now - timedelta(days=30))
+    to_dt = _parse_range_bound(cal_to, now + timedelta(days=365), end_of_day=True)
+    query_from = (from_dt - timedelta(days=1)).strftime("%Y%m%dT%H%M%SZ")
+    query_to = (to_dt + timedelta(days=1)).strftime("%Y%m%dT%H%M%SZ")
+
+    body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+        '<d:prop><d:getetag/>'
+        f'<c:calendar-data><c:expand start="{query_from}" end="{query_to}"/></c:calendar-data>'
+        '</d:prop>'
+        '<c:filter><c:comp-filter name="VCALENDAR">'
+        '<c:comp-filter name="VEVENT">'
+        f'<c:time-range start="{query_from}" end="{query_to}"/>'
+        '</c:comp-filter></c:comp-filter></c:filter>'
+        '</c:calendar-query>'
+    )
 
     all_events = []
     base_url = env["NEXTCLOUD_URL"].rstrip("/")
+    ns = {"d": "DAV:", "c": "urn:ietf:params:xml:ns:caldav"}
 
     for cal in calendars:
         cal_name = cal.get("name", "")
         cal_href = cal.get("href", "").rstrip("/")
         cal_url = base_url + cal_href + "/"
 
-        # Use PROPFIND with Depth: infinity to get all .ics files
-        # (REPORT method is not supported by this Nextcloud server)
-        args = curl_xml(env) + [
-            "-X", "PROPFIND",
-            "-H", f"Depth: infinity",
+        args = curl_basic(env) + [
+            "-X", "REPORT",
+            "-H", "Depth: 1",
+            "-H", "Content-Type: application/xml",
+            "--data-binary", body,
             cal_url,
         ]
-        output = run_curl(args)
-        if isinstance(output, dict) and "error" in output:
+        result = subprocess.run(args, capture_output=True, text=True)
+        if result.returncode != 0 or not result.stdout:
             continue
 
-        # Find all .ics hrefs
-        ics_hrefs = re.findall(r"<d:href>([^<]+\.ics)</d:href>", output)
-        # Filter out the calendar root itself
-        ics_hrefs = [h for h in ics_hrefs if not h.rstrip("/").endswith(cal_href.rstrip("/"))]
+        try:
+            root = ET.fromstring(result.stdout)
+        except ET.ParseError:
+            continue
 
-        # Fetch and parse each .ics file
-        for href in ics_hrefs:
-            # URL encode href properly
-            decoded = urllib.parse.unquote(href)
-            encoded = urllib.parse.quote(decoded, safe="/:")
-            ics_url = base_url + encoded
+        for resp in root.findall("d:response", ns):
+            href_el = resp.find("d:href", ns)
+            href = href_el.text if href_el is not None else ""
+            for cal_data in resp.findall(".//c:calendar-data", ns):
+                ics_text = cal_data.text or ""
+                if "BEGIN:VEVENT" not in ics_text:
+                    continue
+                for event in parse_all_vevents(ics_text):
+                    event["calendar"] = cal_name
+                    event["href"] = href
+                    all_events.append(event)
 
-            get_args = curl_basic(env) + [
-                "-X", "GET",
-                "-H", "Accept: text/calendar",
-                ics_url,
-            ]
-            ics_data = run_curl(get_args)
-            if isinstance(ics_data, dict) or not ics_data:
-                continue
-            if "BEGIN:VCALENDAR" not in ics_data:
-                continue
+    # Client-side overlap filter tightens the padded server-side window back
+    # to what the caller asked for. Same normaliser used elsewhere.
+    def _norm_dt(s, end_of_day=False):
+        if not s:
+            return ""
+        s = s.replace("-", "").replace(":", "").rstrip("Z").replace(" ", "T")
+        if len(s) == 8 and s.isdigit():
+            return s + ("T235959" if end_of_day else "T000000")
+        if "T" in s:
+            date_part, time_part = s.split("T", 1)
+            time_part = (time_part + "000000")[:6]
+            return date_part + "T" + time_part
+        return s
 
-            # Extract UID from the ics data for filtering
-            uid_match = re.search(r"^UID:([^\r\n]+)", ics_data, re.MULTILINE)
-            event_uid = uid_match.group(1).strip() if uid_match else ""
-
-            event_data = parse_icalendar(ics_data, item_type="VEVENT")
-            if event_data:
-                event_data["calendar"] = cal_name
-                event_data["href"] = href
-                all_events.append(event_data)
-
-    # Filter by date range if provided
     if cal_from:
-        all_events = [e for e in all_events if e.get("start", "") >= cal_from]
+        from_n = _norm_dt(cal_from, end_of_day=False)
+        all_events = [
+            e for e in all_events
+            if _norm_dt(e.get("end") or e.get("start", ""), end_of_day=True) >= from_n
+        ]
     if cal_to:
-        all_events = [e for e in all_events if e.get("end", "") <= cal_to]
+        to_n = _norm_dt(cal_to, end_of_day=True)
+        all_events = [
+            e for e in all_events
+            if _norm_dt(e.get("start", ""), end_of_day=False) <= to_n
+        ]
 
     return {"status": "success", "data": all_events}
+
+
+def _parse_range_bound(s, default_dt, end_of_day=False):
+    """Parse a --from / --to string into a UTC datetime.
+    Accepts 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM', 'YYYY-MM-DDTHH:MM:SS' (with
+    optional trailing Z). Falls back to default_dt when s is empty/None.
+    """
+    if not s:
+        return default_dt
+    s = s.rstrip("Z")
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if fmt == "%Y-%m-%d" and end_of_day:
+                dt = dt.replace(hour=23, minute=59, second=59)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return default_dt
+
+
+def parse_all_vevents(ics_text):
+    """Return every VEVENT block in an iCalendar text as a parsed dict.
+    A single .ics resource may contain a master VEVENT plus one
+    RECURRENCE-ID override per exception; with server-side <expand>, it
+    contains one VEVENT per expanded instance in the window.
+    """
+    events = []
+    for m in re.finditer(r"BEGIN:VEVENT(.*?)END:VEVENT", ics_text, re.DOTALL):
+        block = "BEGIN:VEVENT" + m.group(1) + "END:VEVENT"
+        parsed = parse_icalendar(block, item_type="VEVENT")
+        if parsed:
+            events.append(parsed)
+    return events
 
 
 def cmd_calendar_create(env, summary, start, end, calendar=None, location=None, description=None):
@@ -1049,13 +1158,14 @@ def cmd_calendar_create(env, summary, start, end, calendar=None, location=None, 
     cal_url = base_url + cal_href + "/" + uid + ".ics"
 
     args = curl_basic(env) + [
+        "--fail",
         "-X", "PUT",
         "-H", "Content-Type: text/calendar; charset=utf-8",
         "-d", vevent_body,
         cal_url,
     ]
     result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode in (0, 201, 204):
+    if result.returncode == 0:
         return {"status": "success", "data": {"uid": uid, "calendar": selected_cal.get("name", cal_href), "summary": summary, "start": start, "end": end, "created": True}}
     return {"status": "error", "message": result.stderr or f"Create event failed (code {result.returncode})"}
 
@@ -1130,15 +1240,18 @@ def cmd_calendar_edit(env, uid, calendar=None, summary=None, start=None, end=Non
     tzid = env.get("NEXTCLOUD_TIMEZONE", "UTC")
     new_body = vevent_from_args(ev_summary, ev_start, ev_end, location=ev_location, description=ev_desc, uid=uid, tzid=tzid)
 
-    cal_url = caldav_url(env, f"{found_cal}/{uid}.ics")
+    cal_url = caldav_event_url(env, calendars, found_cal, uid)
+    if not cal_url:
+        return {"status": "error", "message": f"Calendar '{found_cal}' not found"}
     args = curl_basic(env) + [
+        "--fail",
         "-X", "PUT",
         "-H", "Content-Type: text/calendar; charset=utf-8",
         "-d", new_body,
         cal_url,
     ]
     result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode in (0, 201, 204):
+    if result.returncode == 0:
         return {"status": "success", "data": {**event_data, "updated": True}}
     return {"status": "error", "message": result.stderr or f"Edit event failed (code {result.returncode})"}
 
@@ -1153,10 +1266,12 @@ def cmd_calendar_delete(env, uid, calendar=None):
     search_cals = [calendar] if calendar else [c["name"] for c in calendars]
 
     for cal_name in search_cals:
-        cal_url = caldav_url(env, f"{cal_name}/{uid}.ics")
-        args = curl_basic(env) + ["-X", "DELETE", cal_url]
+        cal_url = caldav_event_url(env, calendars, cal_name, uid)
+        if not cal_url:
+            continue
+        args = curl_basic(env) + ["--fail", "-X", "DELETE", cal_url]
         result = subprocess.run(args, capture_output=True, text=True)
-        if result.returncode in (0, 204):
+        if result.returncode == 0:
             return {"status": "success", "data": {"uid": uid, "deleted": True}}
     return {"status": "error", "message": f"Event '{uid}' not found in any calendar"}
 
