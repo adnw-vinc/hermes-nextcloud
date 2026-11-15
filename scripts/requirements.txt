@@ -1,1 +1,4 @@
-caldav>=3.2.0
+# No third-party dependencies are required: the skill uses only the Python
+# standard library plus `curl` (present on virtually every system).
+# (The previously-declared `caldav` dependency was never imported.)
+

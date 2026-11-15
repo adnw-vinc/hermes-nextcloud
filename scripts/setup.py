@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 ENV_FILE = os.path.expanduser("~/.hermes/nextcloud.env")
 
@@ -41,14 +42,28 @@ def save_env(url, user, token):
     print(f"Credentials saved to {ENV_FILE}")
 
 
+def _auth_args(user, token):
+    """Return curl args carrying Basic auth credentials via a temporary
+    0600 config file, so the secret never appears in the process list."""
+    fd = tempfile.NamedTemporaryFile(
+        "w", prefix="hermes-nc-auth-", suffix=".cfg", delete=False
+    )
+    value = f"{user}:{token}".replace("\\", "\\\\").replace('"', '\\"')
+    fd.write(f'user = "{value}"\n')
+    fd.close()
+    os.chmod(fd.name, 0o600)
+    return ["-K", fd.name], fd.name
+
+
 def test_connection(url, user, token):
     """Test connection to Nextcloud and return user info."""
+    auth_args, auth_file = _auth_args(user, token)
     try:
         # Try a simple PROPFIND on the root
         result = subprocess.run(
             [
                 "curl", "--silent", "--show-error",
-                "-u", f"{user}:{token}",
+                *auth_args,
                 "-X", "PROPFIND",
                 "-H", "Depth: 0",
                 f"{url.rstrip('/')}/remote.php/dav/files/{user}/",
@@ -68,6 +83,11 @@ def test_connection(url, user, token):
         return False, "Connection timed out"
     except Exception as e:
         return False, str(e)
+    finally:
+        try:
+            os.unlink(auth_file)
+        except OSError:
+            pass
 
 
 def interactive_setup():

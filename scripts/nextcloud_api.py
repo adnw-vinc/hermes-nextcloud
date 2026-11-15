@@ -5,16 +5,16 @@ Provides unified access to Nextcloud via WebDAV, Notes API, and CalDAV/CardDAV.
 """
 
 import argparse
+import atexit
 import json
 import os
 import re
 import subprocess
 import sys
-import textwrap
+import tempfile
 import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Config
@@ -23,11 +23,12 @@ from pathlib import Path
 ENV_FILE = os.path.expanduser("~/.hermes/nextcloud.env")
 
 
-def load_env():
+def load_env(env_file=None):
     """Load credentials from nextcloud.env or environment variables."""
+    env_file = env_file or ENV_FILE
     env = {}
-    if os.path.exists(ENV_FILE):
-        with open(ENV_FILE) as f:
+    if os.path.exists(env_file):
+        with open(env_file) as f:
             for line in f:
                 line = line.strip()
                 if "=" in line and not line.startswith("#"):
@@ -52,79 +53,145 @@ def check_credentials(env):
         sys.exit(1)
 
 
-def curl_basic(env):
-    """Return curl base args with basic auth."""
+# HTTP status codes treated as success by the API wrappers.
+# 207 Multi-Status is the normal WebDAV/CalDAV success code for PROPFIND.
+HTTP_OK = (200, 201, 204, 207)
+
+_temp_auth_files = []
+
+
+def _cleanup_temp_auth_files():
+    for path in _temp_auth_files:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+atexit.register(_cleanup_temp_auth_files)
+
+
+def _auth_args(env):
+    """Return curl args carrying Basic auth credentials WITHOUT exposing them
+    in the process list.
+
+    The credentials are written to a temporary curl config file (chmod 0600)
+    that curl reads via -K. Passing them as `-u user:token` would leak them to
+    any local user via `ps` / /proc/<pid>/cmdline.
+    """
+    fd = tempfile.NamedTemporaryFile(
+        "w", prefix="hermes-nc-auth-", suffix=".cfg", delete=False
+    )
+    value = f"{env['NEXTCLOUD_USER']}:{env['NEXTCLOUD_TOKEN']}"
+    value = value.replace("\\", "\\\\").replace('"', '\\"')
+    fd.write(f'user = "{value}"\n')
+    fd.close()
+    os.chmod(fd.name, 0o600)
+    _temp_auth_files.append(fd.name)
+    return ["-K", fd.name]
+
+
+def curl_base(env, accept="application/json"):
+    """Return curl base args with basic auth (via 0600 config file, not argv)."""
     return [
         "curl", "--silent", "--show-error",
-        "-u", f"{env['NEXTCLOUD_USER']}:{env['NEXTCLOUD_TOKEN']}",
-        "-H", "Accept: application/json",
+        *_auth_args(env),
+        "-H", f"Accept: {accept}",
     ]
 
 
-def curl_xml(env):
-    """Return curl base args expecting XML/WebDAV response."""
-    return [
-        "curl", "--silent", "--show-error",
-        "-u", f"{env['NEXTCLOUD_USER']}:{env['NEXTCLOUD_TOKEN']}",
-        "-H", "Accept: application/xml",
-    ]
+def _quote_path(path):
+    """Percent-encode a user-supplied path for use in a URL (preserves '/')."""
+    return urllib.parse.quote(path.lstrip("/"), safe="/")
 
 
 def dav_url(env, path=""):
     """Build WebDAV URL for files endpoint."""
     base = env["NEXTCLOUD_URL"].rstrip("/")
-    user = env["NEXTCLOUD_USER"]
-    path = path.lstrip("/")
-    return f"{base}/remote.php/dav/files/{user}/{path}"
+    user = urllib.parse.quote(env["NEXTCLOUD_USER"], safe="")
+    return f"{base}/remote.php/dav/files/{user}/{_quote_path(path)}"
 
 
-def notes_url(env, path=""):
+def notes_url(env, path="", params=None):
     """Build Nextcloud Notes API URL."""
     base = env["NEXTCLOUD_URL"].rstrip("/")
-    path = path.lstrip("/")
-    return f"{base}/index.php/apps/notes/api/v1/{path}"
+    url = f"{base}/index.php/apps/notes/api/v1/{_quote_path(path)}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    return url
 
 
 def caldav_url(env, path=""):
     """Build CalDAV URL."""
     base = env["NEXTCLOUD_URL"].rstrip("/")
-    user = env["NEXTCLOUD_USER"]
-    path = path.lstrip("/")
-    return f"{base}/remote.php/dav/calendars/{user}/{path}"
+    user = urllib.parse.quote(env["NEXTCLOUD_USER"], safe="")
+    return f"{base}/remote.php/dav/calendars/{user}/{_quote_path(path)}"
 
 
 def carddav_url(env, path=""):
     """Build CardDAV URL."""
     base = env["NEXTCLOUD_URL"].rstrip("/")
-    user = env["NEXTCLOUD_USER"]
+    user = urllib.parse.quote(env["NEXTCLOUD_USER"], safe="")
     path = path.lstrip("/")
     # Address books are under /addressbooks/users/<user>/
     if path.startswith("users/") or path.startswith("system/"):
-        return f"{base}/remote.php/dav/addressbooks/{path}"
-    return f"{base}/remote.php/dav/addressbooks/users/{user}/{path}"
+        return f"{base}/remote.php/dav/addressbooks/{_quote_path(path)}"
+    return f"{base}/remote.php/dav/addressbooks/users/{user}/{_quote_path(path)}"
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def run_curl(args, input_data=None, expected_codes=(0,)):
-    """Execute curl and return stdout. Exits on failure."""
+def curl_request(args, input_data=None, timeout=30):
+    """Execute curl and return (http_code, body, error_message).
+
+    The HTTP status code is captured via curl's `-w` write-out and returned to
+    callers: curl exits 0 even when the server answers 4xx/5xx, so the exit
+    code alone cannot distinguish success from a server-side error.
+    A non-None error_message means the request did not complete (network
+    error, timeout, ...).
+    """
+    full_args = args + ["-w", "\n%{http_code}"]
     try:
         result = subprocess.run(
-            args,
+            full_args,
             input=input_data,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout,
         )
-        if result.returncode not in expected_codes:
-            return {"error": result.stderr or f"Curl exited with {result.returncode}"}
-        return result.stdout
     except subprocess.TimeoutExpired:
-        return {"error": "Request timed out after 30 seconds"}
-    except Exception as e:
-        return {"error": str(e)}
+        return 0, "", f"Request timed out after {timeout} seconds"
+    except Exception as e:  # defensive
+        return 0, "", str(e)
+
+    body = result.stdout or ""
+    code = 0
+    last_nl = body.rfind("\n")
+    if last_nl != -1:
+        tail = body[last_nl + 1:].strip()
+        if tail.isdigit():
+            code = int(tail)
+            body = body[:last_nl]
+
+    if result.returncode != 0:
+        err = (result.stderr or "").strip() or f"curl exited with code {result.returncode}"
+        return code, body, err
+    if code == 0:
+        return 0, body, "curl did not report an HTTP status code"
+    return code, body, None
+
+
+def http_error(code, err, action):
+    """Build a uniform error response for a failed HTTP request."""
+    if err:
+        message = f"{action} failed: {err}"
+    elif code == 401:
+        message = f"{action} failed (HTTP 401): authentication rejected - check NEXTCLOUD_USER and app password"
+    else:
+        message = f"{action} failed (HTTP {code})"
+    return {"status": "error", "message": message}
 
 
 def xml_propfind(url, env, depth="1", props=None):
@@ -146,21 +213,23 @@ def xml_propfind(url, env, depth="1", props=None):
 {props}
 </d:propfind>"""
 
-    args = curl_xml(env) + [
+    args = curl_base(env, accept="application/xml") + [
         "-X", "PROPFIND",
         "-H", f"Depth: {depth}",
         "-H", "Content-Type: application/xml",
-        "-d", xml_body,
+        "--data-binary", "@-",
         url,
     ]
-    output = run_curl(args)
-    if isinstance(output, dict) and "error" in output:
-        return output
+    code, body, err = curl_request(args, input_data=xml_body, timeout=60)
+    if err:
+        return {"status": "error", "message": f"PROPFIND failed: {err}", "http_code": code}
+    if code != 207:
+        return {"status": "error", "message": f"PROPFIND failed (HTTP {code})", "http_code": code}
 
     # Parse XML properly
     try:
         # Strip XML declaration if present for ET compatibility
-        xml_text = output
+        xml_text = body
         root = ET.fromstring(xml_text)
     except ET.ParseError:
         # Fallback: try stripping namespace prefixes that ET doesn't handle well
@@ -232,37 +301,139 @@ def xml_propfind(url, env, depth="1", props=None):
     return results
 
 
+def ical_escape(text):
+    """Escape text for use as an iCalendar TEXT property value (RFC 5545 3.3.11)."""
+    return (
+        text.replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+    )
+
+
+def vcard_escape(text):
+    """Escape text for use as a vCard property value (backslashes, newlines)."""
+    return (
+        text.replace("\\", "\\\\")
+        .replace("\r\n", "\\n")
+        .replace("\r", "\\n")
+        .replace("\n", "\\n")
+    )
+
+
+def ical_datetime(value):
+    """Convert a human datetime to iCalendar format.
+
+    Returns (formatted_string, is_date_only).
+    """
+    value = value.strip()
+    # Preserve a trailing Z (UTC designator): fromisoformat() accepts it on
+    # Python 3.11+ but silently drops it, which would turn a UTC time into a
+    # floating local time.
+    is_utc = value.endswith("Z")
+    if is_utc:
+        value = value[:-1]
+    suffix = "Z" if is_utc else ""
+    # Handle date-only: YYYY-MM-DD
+    if len(value) == 10 and value[4] == "-" and value[7] == "-":
+        return value.replace("-", ""), True
+    # Handle ISO format with T: YYYY-MM-DDTHH:MM:SS or YYYY-MM-DDTHH:MM
+    if "T" in value:
+        try:
+            parsed = datetime.fromisoformat(value.replace(" ", "T"))
+            return parsed.strftime("%Y%m%dT%H%M%S") + suffix, False
+        except ValueError:
+            pass
+    # Handle space-separated: YYYY-MM-DD HH:MM or YYYY-MM-DD HH:MM:SS
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        return parsed.strftime("%Y%m%dT%H%M%S") + suffix, False
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M")
+        return parsed.strftime("%Y%m%dT%H%M%S") + suffix, False
+    except ValueError:
+        pass
+    # Fallback: return as-is
+    return value + suffix, "T" in value
+
+
+def ical_replace_properties(body, updates, component):
+    """Replace (or insert) property lines inside the first component block.
+
+    Keeps every other property intact instead of rebuilding the object from a
+    parsed subset, so alarms, categories and similar metadata survive edits.
+    `updates` maps property base names (e.g. "SUMMARY") to full replacement
+    lines (e.g. "SUMMARY:New title"). Original line parameters (e.g.
+    DTSTART;TZID=...) are preserved on the replacement line.
+    """
+    begin, end = f"BEGIN:{component}", f"END:{component}"
+    if begin not in body or end not in body:
+        return None
+    pre, rest = body.replace("\r\n", "\n").split(begin, 1)
+    block, post = rest.split(end, 1)
+    lines = block.split("\n")
+
+    remaining = dict(updates)
+    out = []
+    for line in lines:
+        name_part = line.split(":", 1)[0] if line.strip() else ""
+        base = name_part.split(";", 1)[0].strip().upper()
+        if line.strip() and base in remaining:
+            new_line = remaining.pop(base)
+            orig_params = name_part.split(";", 1)[1] if ";" in name_part else None
+            new_name_part = new_line.split(":", 1)[0]
+            if orig_params and ";" not in new_name_part:
+                new_value = new_line.split(":", 1)[1] if ":" in new_line else ""
+                out.append(f"{new_name_part};{orig_params}:{new_value}")
+            else:
+                out.append(new_line)
+        else:
+            out.append(line)
+
+    if remaining:
+        # Insert properties that were not present in the original block.
+        insert_at = len(out) - 1 if out and not out[-1].strip() else len(out)
+        for new_line in remaining.values():
+            out.insert(insert_at, new_line)
+            insert_at += 1
+    return pre + begin + "\n".join(out) + end + post
+
+
 def vcard_from_args(name, email=None, phone=None, organization=None, title=None, note=None):
     """Build a VCARD string from contact fields."""
     lines = [
         "BEGIN:VCARD",
         "VERSION:3.0",
-        f"FN:{name}",
+        f"FN:{vcard_escape(name)}",
     ]
     parts = name.rsplit(" ", 1)
     if len(parts) == 2:
-        lines.append(f"N:{parts[1]};{parts[0]};;;")
+        lines.append(f"N:{vcard_escape(parts[1]).replace(';', '\\;')};{vcard_escape(parts[0]).replace(';', '\\;')};;;")
     else:
-        lines.append(f"N:;{name};;;")
+        lines.append(f"N:;{vcard_escape(name).replace(';', '\\;')};;;")
     if email:
         for e in email.split(","):
-            lines.append(f"EMAIL;TYPE=internet:{e.strip()}")
+            lines.append(f"EMAIL;TYPE=internet:{vcard_escape(e.strip())}")
     if phone:
         for p in phone.split(","):
-            lines.append(f"TEL;TYPE=voice:{p.strip()}")
+            lines.append(f"TEL;TYPE=voice:{vcard_escape(p.strip())}")
     if organization:
-        lines.append(f"ORG:{organization}")
+        lines.append(f"ORG:{vcard_escape(organization)}")
     if title:
-        lines.append(f"TITLE:{title}")
+        lines.append(f"TITLE:{vcard_escape(title)}")
     if note:
-        lines.append(f"NOTE:{note}")
+        lines.append(f"NOTE:{vcard_escape(note)}")
     lines.append("END:VCARD")
     return "\n".join(lines)
 
 
-def vtodo_from_args(title, due=None, priority=None, description=None, status=None):
+def vtodo_from_args(title, due=None, priority=None, description=None, status=None, uid=None):
     """Build a VTODO iCalendar component from fields."""
-    uid = f"hermes-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{os.urandom(4).hex()}"
+    if uid is None:
+        uid = f"hermes-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{os.urandom(4).hex()}"
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -270,14 +441,18 @@ def vtodo_from_args(title, due=None, priority=None, description=None, status=Non
         "BEGIN:VTODO",
         f"UID:{uid}",
         f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
-        f"SUMMARY:{title}",
+        f"SUMMARY:{ical_escape(title)}",
     ]
     if due:
-        lines.append(f"DUE:{due}")
+        due_str, is_date = ical_datetime(due)
+        if is_date:
+            lines.append(f"DUE;VALUE=DATE:{due_str}")
+        else:
+            lines.append(f"DUE:{due_str}")
     if priority is not None:
         lines.append(f"PRIORITY:{priority}")
     if description:
-        lines.append(f"DESCRIPTION:{description}")
+        lines.append(f"DESCRIPTION:{ical_escape(description)}")
     if status:
         lines.append(f"STATUS:{status}")
     lines.append("END:VTODO")
@@ -290,43 +465,14 @@ def vevent_from_args(summary, start, end, location=None, description=None, uid=N
     Converts common datetime formats to iCalendar DATE-TIME format (YYYYMMDDTHHMMSS or YYYYMMDD).
     tzid: timezone identifier (e.g., 'UTC', 'Europe/Prague'). Defaults to UTC.
     """
-    from datetime import datetime as dt
-
-    def to_ical_dt(value):
-        """Convert human datetime to iCalendar format. Returns (formatted_string, is_date_only)."""
-        value = value.strip()
-        # Handle date-only: YYYY-MM-DD
-        if len(value) == 10 and value[4] == "-" and value[7] == "-":
-            return value.replace("-", ""), True
-        # Handle ISO format with T: YYYY-MM-DDTHH:MM:SS or YYYY-MM-DDTHH:MM
-        if "T" in value:
-            try:
-                parsed = dt.fromisoformat(value.replace(" ", "T"))
-                return parsed.strftime("%Y%m%dT%H%M%S"), False
-            except ValueError:
-                pass
-        # Handle space-separated: YYYY-MM-DD HH:MM or YYYY-MM-DD HH:MM:SS
-        try:
-            parsed = dt.strptime(value, "%Y-%m-%d %H:%M:%S")
-            return parsed.strftime("%Y%m%dT%H%M%S"), False
-        except ValueError:
-            pass
-        try:
-            parsed = dt.strptime(value, "%Y-%m-%d %H:%M")
-            return parsed.strftime("%Y%m%dT%H%M%S"), False
-        except ValueError:
-            pass
-        # Fallback: return as-is
-        return value, "T" in value
-
-    start_str, start_date = to_ical_dt(start)
-    end_str, end_date = to_ical_dt(end)
+    start_str, start_date = ical_datetime(start)
+    end_str, end_date = ical_datetime(end)
 
     # Determine if these are all-day events (date-only)
     all_day = start_date == True and end_date == True
 
     if uid is None:
-        uid = f"hermes-{dt.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{os.urandom(4).hex()}"
+        uid = f"hermes-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{os.urandom(4).hex()}"
 
     lines = [
         "BEGIN:VCALENDAR",
@@ -334,7 +480,7 @@ def vevent_from_args(summary, start, end, location=None, description=None, uid=N
         "PRODID:-//Hermes Agent//Nextcloud Event//EN",
         "BEGIN:VEVENT",
         f"UID:{uid}",
-        f"DTSTAMP:{dt.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+        f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
     ]
 
     if all_day:
@@ -345,11 +491,11 @@ def vevent_from_args(summary, start, end, location=None, description=None, uid=N
         lines.append(f"DTSTART;TZID={tzid}:{start_str}")
         lines.append(f"DTEND;TZID={tzid}:{end_str}")
 
-    lines.append(f"SUMMARY:{summary}")
+    lines.append(f"SUMMARY:{ical_escape(summary)}")
     if location:
-        lines.append(f"LOCATION:{location}")
+        lines.append(f"LOCATION:{ical_escape(location)}")
     if description:
-        lines.append(f"DESCRIPTION:{description}")
+        lines.append(f"DESCRIPTION:{ical_escape(description)}")
     lines.append("END:VEVENT")
     lines.append("END:VCALENDAR")
     return "\n".join(lines)
@@ -411,16 +557,13 @@ def parse_icalendar(text, item_type="VEVENT"):
 def cmd_check(env):
     """Verify credentials and connectivity."""
     url = dav_url(env, "")
-    args = curl_basic(env) + [
+    args = curl_base(env, accept="application/xml") + [
         "-X", "PROPFIND",
         "-H", "Depth: 0",
         url,
     ]
-    output = run_curl(args)
-    if isinstance(output, dict) and "error" in output:
-        return {"status": "error", "message": output["error"]}
-    # Check if we got a valid response (should be XML with 207 Multi-Status)
-    if "<?xml" in output or "<d:href>" in output:
+    code, body, err = curl_request(args)
+    if code in (207, 200):
         return {
             "status": "success",
             "data": {
@@ -428,7 +571,16 @@ def cmd_check(env):
                 "user": env["NEXTCLOUD_USER"],
             }
         }
-    return {"status": "error", "message": "Authentication failed"}
+    if err:
+        return {"status": "error", "message": err}
+    if code == 401:
+        return {"status": "error", "message": "Authentication failed: check username and app password"}
+    return {"status": "error", "message": f"Authentication failed (HTTP {code})"}
+
+
+def _dav_user_prefix(env):
+    """Return the URL-encoded WebDAV path prefix used in server hrefs."""
+    return f"/remote.php/dav/files/{urllib.parse.quote(env['NEXTCLOUD_USER'], safe='')}"
 
 
 def cmd_files_list(env, path="/"):
@@ -437,14 +589,14 @@ def cmd_files_list(env, path="/"):
     results = xml_propfind(url, env, depth="1")
     if isinstance(results, dict) and "error" in results:
         return results
+    user_path = _dav_user_prefix(env)
     formatted = []
     for r in results:
         href = r["href"]
-        # Extract path relative to user
-        user_path = f"/remote.php/dav/files/{env['NEXTCLOUD_USER']}/"
+        # Extract path relative to user (href is percent-encoded; decode for display)
         item_path = href[len(user_path):] if href.startswith(user_path) else href
         formatted.append({
-            "path": "/" + item_path.lstrip("/"),
+            "path": "/" + urllib.parse.unquote(item_path).lstrip("/"),
             "type": r.get("type", "file"),
             "size": r.get("size", 0),
             "content_type": r.get("content_type", ""),
@@ -457,61 +609,82 @@ def cmd_files_list(env, path="/"):
 def cmd_files_get(env, path):
     """Get file content."""
     url = dav_url(env, path)
-    args = curl_basic(env) + ["-X", "GET", url]
-    output = run_curl(args)
-    if isinstance(output, dict) and "error" in output:
-        return output
-    return {"status": "success", "data": {"path": path, "content": output}}
+    args = curl_base(env) + ["-X", "GET", url]
+    code, body, err = curl_request(args, timeout=120)
+    if err:
+        return http_error(code, err, f"Get '{path}'")
+    if code == 404:
+        return {"status": "error", "message": f"File not found: {path}"}
+    if code != 200:
+        return http_error(code, None, f"Get '{path}'")
+    return {"status": "success", "data": {"path": path, "content": body}}
 
 
 def cmd_files_upload(env, path, content):
-    """Upload a file via PUT."""
+    """Upload a file via PUT. Content is streamed via stdin (never argv),
+    which also removes the ~128 KiB command-line argument size limit."""
     url = dav_url(env, path)
-    args = curl_basic(env) + [
+    args = curl_base(env) + [
         "-X", "PUT",
         "-H", "Content-Type: application/octet-stream",
-        "-d", content,
+        "--data-binary", "@-",
         url,
     ]
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode == 0 or result.returncode == 201:
-        return {"status": "success", "data": {"path": path, "uploaded": True}}
-    return {"status": "error", "message": result.stderr or f"Upload failed (code {result.returncode})"}
+    code, body, err = curl_request(args, input_data=content, timeout=120)
+    if err:
+        return http_error(code, err, f"Upload to '{path}'")
+    if code not in (200, 201, 204):
+        return http_error(code, None, f"Upload to '{path}'")
+    return {"status": "success", "data": {"path": path, "uploaded": True}}
 
 
 def cmd_files_mkdir(env, path):
     """Create a directory via MKCOL."""
     url = dav_url(env, path)
-    args = curl_basic(env) + ["-X", "MKCOL", url]
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode == 0 or result.returncode == 201:
-        return {"status": "success", "data": {"path": path, "created": True}}
-    return {"status": "error", "message": result.stderr or f"mkdir failed (code {result.returncode})"}
+    args = curl_base(env) + ["-X", "MKCOL", url]
+    code, body, err = curl_request(args)
+    if err:
+        return http_error(code, err, f"mkdir '{path}'")
+    if code == 405:
+        return {"status": "error", "message": f"Directory already exists: {path}"}
+    if code not in (200, 201):
+        return http_error(code, None, f"mkdir '{path}'")
+    return {"status": "success", "data": {"path": path, "created": True}}
 
 
 def cmd_files_delete(env, path):
     """Delete a file or directory via DELETE."""
     url = dav_url(env, path)
-    args = curl_basic(env) + ["-X", "DELETE", url]
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode == 0 or result.returncode == 204:
-        return {"status": "success", "data": {"path": path, "deleted": True}}
-    return {"status": "error", "message": result.stderr or f"Delete failed (code {result.returncode})"}
+    args = curl_base(env) + ["-X", "DELETE", url]
+    code, body, err = curl_request(args)
+    if err:
+        return http_error(code, err, f"Delete '{path}'")
+    if code == 404:
+        return {"status": "error", "message": f"Not found: {path}"}
+    if code not in (200, 204):
+        return http_error(code, None, f"Delete '{path}'")
+    return {"status": "success", "data": {"path": path, "deleted": True}}
 
 
 def cmd_files_move(env, src, dst):
     """Move or rename a file via MOVE."""
     src_url = dav_url(env, src)
     dst_url = dav_url(env, dst)
-    args = curl_basic(env) + [
+    args = curl_base(env) + [
         "-X", "MOVE",
         "-H", f"Destination: {dst_url}",
         src_url,
     ]
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode == 0 or result.returncode == 201:
-        return {"status": "success", "data": {"src": src, "dst": dst, "moved": True}}
-    return {"status": "error", "message": result.stderr or f"Move failed (code {result.returncode})"}
+    code, body, err = curl_request(args)
+    if err:
+        return http_error(code, err, f"Move '{src}' -> '{dst}'")
+    if code == 404:
+        return {"status": "error", "message": f"Source not found: {src}"}
+    if code == 412:
+        return {"status": "error", "message": f"Destination already exists: {dst}"}
+    if code not in (200, 201, 204):
+        return http_error(code, None, f"Move '{src}' -> '{dst}'")
+    return {"status": "success", "data": {"src": src, "dst": dst, "moved": True}}
 
 
 def cmd_files_search(env, query):
@@ -520,13 +693,15 @@ def cmd_files_search(env, query):
     url = dav_url(env, "")
     results = xml_propfind(url, env, depth="infinity")
     if isinstance(results, dict) and "error" in results:
+        if results.get("http_code") == 400:
+            return {"status": "error", "message": "Server rejected Depth: infinity search (Nextcloud disables it by default; set 'dav.propfind.depth_infinity' => true in config.php, or browse directories instead)"}
         return results
     query_lower = query.lower()
+    user_path = _dav_user_prefix(env)
     matched = []
     for r in results:
         href = r["href"]
-        user_path = f"/remote.php/dav/files/{env['NEXTCLOUD_USER']}/"
-        item_path = href[len(user_path):] if href.startswith(user_path) else href
+        item_path = urllib.parse.unquote(href[len(user_path):] if href.startswith(user_path) else href)
         filename = item_path.split("/")[-1]
         if query_lower in filename.lower():
             matched.append({
@@ -539,52 +714,60 @@ def cmd_files_search(env, query):
 
 def cmd_notes_list(env, category=None):
     """List all notes via Nextcloud Notes API."""
-    url = notes_url(env, "notes")
-    if category:
-        url += f"?category={category}"
-    args = curl_basic(env) + ["-X", "GET", url]
-    output = run_curl(args)
-    if isinstance(output, dict) and "error" in output:
-        return output
+    url = notes_url(env, "notes", params={"category": category} if category else None)
+    args = curl_base(env) + ["-X", "GET", url]
+    code, body, err = curl_request(args)
+    if err:
+        return http_error(code, err, "List notes")
+    if code == 404:
+        return {"status": "error", "message": "Notes API returned 404 - is the Notes app installed?"}
+    if code != 200:
+        return http_error(code, None, "List notes")
     try:
-        notes = json.loads(output)
+        notes = json.loads(body)
         return {"status": "success", "data": notes}
     except json.JSONDecodeError:
-        return {"status": "error", "message": f"Failed to parse notes response: {output[:200]}"}
+        return {"status": "error", "message": f"Failed to parse notes response: {body[:200]}"}
 
 
 def cmd_notes_get(env, note_id):
     """Get a single note by ID."""
     url = notes_url(env, f"notes/{note_id}")
-    args = curl_basic(env) + ["-X", "GET", url]
-    output = run_curl(args)
-    if isinstance(output, dict) and "error" in output:
-        return output
+    args = curl_base(env) + ["-X", "GET", url]
+    code, body, err = curl_request(args)
+    if err:
+        return http_error(code, err, f"Get note {note_id}")
+    if code == 404:
+        return {"status": "error", "message": f"Note {note_id} not found (or the Notes app is not installed)"}
+    if code != 200:
+        return http_error(code, None, f"Get note {note_id}")
     try:
-        note = json.loads(output)
+        note = json.loads(body)
         return {"status": "success", "data": note}
     except json.JSONDecodeError:
-        return {"status": "error", "message": f"Failed to parse note response: {output[:200]}"}
+        return {"status": "error", "message": f"Failed to parse note response: {body[:200]}"}
 
 
 def cmd_notes_create(env, title, content, category=None):
     """Create a new note."""
     url = notes_url(env, "notes")
     payload = json.dumps({"title": title, "content": content, "category": category or ""})
-    args = curl_basic(env) + [
+    args = curl_base(env) + [
         "-X", "POST",
         "-H", "Content-Type: application/json",
-        "-d", payload,
+        "--data-binary", "@-",
         url,
     ]
-    output = run_curl(args)
-    if isinstance(output, dict) and "error" in output:
-        return output
+    code, body, err = curl_request(args, input_data=payload)
+    if err:
+        return http_error(code, err, "Create note")
+    if code not in (200, 201):
+        return http_error(code, None, "Create note")
     try:
-        note = json.loads(output)
+        note = json.loads(body)
         return {"status": "success", "data": note}
     except json.JSONDecodeError:
-        return {"status": "error", "message": f"Failed to parse create response: {output[:200]}"}
+        return {"status": "error", "message": f"Failed to parse create response: {body[:200]}"}
 
 
 def cmd_notes_edit(env, note_id, title=None, content=None, category=None):
@@ -605,31 +788,39 @@ def cmd_notes_edit(env, note_id, title=None, content=None, category=None):
         data["category"] = category
     payload = json.dumps(data)
     etag = data.get("etag", "")
-    args = curl_basic(env) + [
+    args = curl_base(env) + [
         "-X", "PUT",
         "-H", "Content-Type: application/json",
         "-H", f"If-Match: {etag}",
-        "-d", payload,
+        "--data-binary", "@-",
         url,
     ]
-    output = run_curl(args)
-    if isinstance(output, dict) and "error" in output:
-        return output
+    code, body, err = curl_request(args, input_data=payload)
+    if err:
+        return http_error(code, err, f"Edit note {note_id}")
+    if code == 412:
+        return {"status": "error", "message": f"Edit note {note_id} failed: etag mismatch (note changed concurrently)"}
+    if code != 200:
+        return http_error(code, None, f"Edit note {note_id}")
     try:
-        note = json.loads(output)
+        note = json.loads(body)
         return {"status": "success", "data": note}
     except json.JSONDecodeError:
-        return {"status": "error", "message": f"Failed to parse edit response: {output[:200]}"}
+        return {"status": "error", "message": f"Failed to parse edit response: {body[:200]}"}
 
 
 def cmd_notes_delete(env, note_id):
     """Delete a note. Per Notes API v1 docs, DELETE returns 200 OK."""
     url = notes_url(env, f"notes/{note_id}")
-    args = curl_basic(env) + ["-X", "DELETE", url]
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode == 0 or result.returncode == 200:
-        return {"status": "success", "data": {"id": note_id, "deleted": True}}
-    return {"status": "error", "message": result.stderr or f"Delete failed (code {result.returncode})"}
+    args = curl_base(env) + ["-X", "DELETE", url]
+    code, body, err = curl_request(args)
+    if err:
+        return http_error(code, err, f"Delete note {note_id}")
+    if code == 404:
+        return {"status": "error", "message": f"Note {note_id} not found"}
+    if code not in (200, 204):
+        return http_error(code, None, f"Delete note {note_id}")
+    return {"status": "success", "data": {"id": note_id, "deleted": True}}
 
 
 def cmd_calendars_list(env, cal_type="events"):
@@ -652,9 +843,11 @@ def cmd_calendars_list(env, cal_type="events"):
         # Only show calendar collections (depth 1, not individual events)
         if not href.rstrip("/").endswith(env["NEXTCLOUD_USER"]) and \
            "/calendars/" in href and not re.search(r"/calendars/[^/]+/[^/]+$", href):
-            displayname = r.get("displayname", href.split("/")[-2])
+            # href-derived fallbacks are percent-encoded; decode so downstream
+            # URL building (which re-encodes once) does not double-encode.
+            displayname = r.get("displayname") or urllib.parse.unquote(href.split("/")[-2])
             formatted.append({
-                "id": href.split("/")[-1].rstrip("/"),
+                "id": urllib.parse.unquote(href.split("/")[-1].rstrip("/")),
                 "name": displayname,
                 "type": cal_type,
                 "href": href,
@@ -677,7 +870,7 @@ def cmd_tasks_list(env, calendar=None):
         href = c.get("href", "")
         # Look for calendars that contain VTODO (task) components
         if "/calendars/" in href and c.get("type") == "dir":
-            cal_name = href.split("/")[-1].rstrip("/")
+            cal_name = urllib.parse.unquote(href.split("/")[-1].rstrip("/"))
             if calendar is None or cal_name == calendar:
                 task_calendars.append({"name": cal_name, "href": href})
 
@@ -694,13 +887,13 @@ def cmd_tasks_list(env, calendar=None):
 
         # Use PROPFIND with Depth: infinity to get all .ics files
         # (REPORT method is not supported by Nextcloud CalDAV servers)
-        args = curl_xml(env) + [
+        args = curl_base(env, accept="application/xml") + [
             "-X", "PROPFIND",
             "-H", "Depth: infinity",
             cal_url,
         ]
-        output = run_curl(args)
-        if isinstance(output, dict) and "error" in output:
+        code, output, err = curl_request(args, timeout=60)
+        if err or code != 207:
             continue
 
         # Find all .ics hrefs
@@ -714,13 +907,13 @@ def cmd_tasks_list(env, calendar=None):
             encoded = urllib.parse.quote(decoded, safe="/:")
             ics_url = base_url + encoded
 
-            get_args = curl_basic(env) + [
+            get_args = curl_base(env) + [
                 "-X", "GET",
                 "-H", "Accept: text/calendar",
                 ics_url,
             ]
-            ics_data = run_curl(get_args)
-            if isinstance(ics_data, dict) or not ics_data:
+            get_code, ics_data, get_err = curl_request(get_args)
+            if get_err or get_code != 200 or not ics_data:
                 continue
             if "BEGIN:VCALENDAR" not in ics_data:
                 continue
@@ -753,16 +946,18 @@ def cmd_tasks_create(env, title, calendar=None, due=None, priority=None, descrip
     vtodo_body, uid = vtodo_from_args(title, due=due, priority=priority, description=description)
     cal_url = caldav_url(env, f"{cal_name}/{uid}.ics")
 
-    args = curl_basic(env) + [
+    args = curl_base(env) + [
         "-X", "PUT",
         "-H", "Content-Type: text/calendar; charset=utf-8",
-        "-d", vtodo_body,
+        "--data-binary", "@-",
         cal_url,
     ]
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode in (0, 201, 204):
-        return {"status": "success", "data": {"uid": uid, "calendar": cal_name, "summary": title, "created": True}}
-    return {"status": "error", "message": result.stderr or f"Create task failed (code {result.returncode})"}
+    code, body, err = curl_request(args, input_data=vtodo_body)
+    if err:
+        return http_error(code, err, "Create task")
+    if code not in (200, 201, 204):
+        return http_error(code, None, "Create task")
+    return {"status": "success", "data": {"uid": uid, "calendar": cal_name, "summary": title, "created": True}}
 
 
 def cmd_tasks_edit(env, uid, calendar=None, title=None, due=None, priority=None, description=None):
@@ -782,6 +977,7 @@ def cmd_tasks_edit(env, uid, calendar=None, title=None, due=None, priority=None,
     task_data = None
     found_cal = None
     found_href = None
+    found_raw = None
     for cal_name in search_cals:
         cal_entry = next((c for c in calendars if c.get("name") == cal_name), None)
         if not cal_entry:
@@ -790,13 +986,13 @@ def cmd_tasks_edit(env, uid, calendar=None, title=None, due=None, priority=None,
         cal_url = base_url + cal_href + "/"
 
         # PROPFIND with Depth: infinity to get all .ics files
-        args = curl_xml(env) + [
+        args = curl_base(env, accept="application/xml") + [
             "-X", "PROPFIND",
             "-H", "Depth: infinity",
             cal_url,
         ]
-        output = run_curl(args)
-        if isinstance(output, dict) and "error" in output:
+        prop_code, output, prop_err = curl_request(args, timeout=60)
+        if prop_err or prop_code != 207:
             continue
 
         ics_hrefs = re.findall(r"<d:href>([^<]+\.ics)</d:href>", output)
@@ -807,22 +1003,23 @@ def cmd_tasks_edit(env, uid, calendar=None, title=None, due=None, priority=None,
             encoded = urllib.parse.quote(decoded, safe="/:")
             ics_url = base_url + encoded
 
-            get_args = curl_basic(env) + [
+            get_args = curl_base(env) + [
                 "-X", "GET",
                 "-H", "Accept: text/calendar",
                 ics_url,
             ]
-            ics_data = run_curl(get_args)
-            if isinstance(ics_data, dict) or not ics_data:
+            get_code, raw_ics, get_err = curl_request(get_args)
+            if get_err or get_code != 200 or not raw_ics:
                 continue
-            if "BEGIN:VCALENDAR" not in ics_data:
+            if "BEGIN:VCALENDAR" not in raw_ics:
                 continue
 
-            parsed = parse_icalendar(ics_data, item_type="VTODO")
+            parsed = parse_icalendar(raw_ics, item_type="VTODO")
             if parsed.get("uid") == uid:
                 task_data = parsed
                 found_cal = cal_name
                 found_href = href
+                found_raw = raw_ics
                 break
         if task_data:
             break
@@ -830,33 +1027,47 @@ def cmd_tasks_edit(env, uid, calendar=None, title=None, due=None, priority=None,
     if not task_data:
         return {"status": "error", "message": f"Task '{uid}' not found"}
 
-    # Build updated VTODO
-    summary = title if title is not None else task_data.get("summary", "")
-    task_due = due if due is not None else task_data.get("due", "")
-    task_priority = priority if priority is not None else task_data.get("priority")
-    task_desc = description if description is not None else task_data.get("description", "")
-
-    new_body, _ = vtodo_from_args(
-        summary,
-        due=task_due,
-        priority=task_priority,
-        description=task_desc,
-        status="COMPLETED" if task_data.get("status") == "COMPLETED" else None,
-    )
-    # Preserve original UID
-    new_body = new_body.replace(f"UID:{uid}", f"UID:{uid}", 1)
+    # Update properties in place so alarms, categories and similar metadata
+    # survive the edit; only the explicitly provided fields change.
+    updates = {}
+    if title is not None:
+        updates["SUMMARY"] = f"SUMMARY:{ical_escape(title)}"
+    if due is not None:
+        due_str, is_date = ical_datetime(due)
+        updates["DUE"] = f"DUE;VALUE=DATE:{due_str}" if is_date else f"DUE:{due_str}"
+    if priority is not None:
+        updates["PRIORITY"] = f"PRIORITY:{priority}"
+    if description is not None:
+        updates["DESCRIPTION"] = f"DESCRIPTION:{ical_escape(description)}"
+    new_body = ical_replace_properties(found_raw, updates, "VTODO")
+    if new_body is None:
+        # Fallback: rebuild while preserving the original UID (the UID in the
+        # body must match the request URL or the server rejects the PUT).
+        summary = title if title is not None else task_data.get("summary", "")
+        task_due = due if due is not None else task_data.get("due", "")
+        task_priority = priority if priority is not None else task_data.get("priority")
+        task_desc = description if description is not None else task_data.get("description", "")
+        new_body, _ = vtodo_from_args(
+            summary,
+            due=task_due,
+            priority=task_priority,
+            description=task_desc,
+            uid=uid,
+        )
 
     cal_url = caldav_url(env, f"{found_cal}/{uid}.ics")
-    args = curl_basic(env) + [
+    args = curl_base(env) + [
         "-X", "PUT",
         "-H", "Content-Type: text/calendar; charset=utf-8",
-        "-d", new_body,
+        "--data-binary", "@-",
         cal_url,
     ]
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode in (0, 201, 204):
-        return {"status": "success", "data": {**task_data, "updated": True}}
-    return {"status": "error", "message": result.stderr or f"Edit task failed (code {result.returncode})"}
+    code, body, err = curl_request(args, input_data=new_body)
+    if err:
+        return http_error(code, err, f"Edit task '{uid}'")
+    if code not in (200, 201, 204):
+        return http_error(code, None, f"Edit task '{uid}'")
+    return {"status": "success", "data": {**task_data, "updated": True}}
 
 
 def cmd_tasks_complete(env, uid, calendar=None):
@@ -874,6 +1085,7 @@ def cmd_tasks_complete(env, uid, calendar=None):
 
     task_data = None
     found_cal = None
+    found_raw = None
     for cal_name in search_cals:
         cal_entry = next((c for c in calendars if c.get("name") == cal_name), None)
         if not cal_entry:
@@ -881,9 +1093,11 @@ def cmd_tasks_complete(env, uid, calendar=None):
         cal_href = cal_entry.get("href", "").rstrip("/")
         cal_url = base_url + cal_href + "/"
 
-        args = curl_xml(env) + ["-X", "PROPFIND", "-H", "Depth: infinity", cal_url]
-        output = run_curl(args)
-        if isinstance(output, dict) and "error" in output:
+        args = curl_base(env, accept="application/xml") + [
+            "-X", "PROPFIND", "-H", "Depth: infinity", cal_url,
+        ]
+        prop_code, output, prop_err = curl_request(args, timeout=60)
+        if prop_err or prop_code != 207:
             continue
 
         ics_hrefs = re.findall(r"<d:href>([^<]+\.ics)</d:href>", output)
@@ -893,14 +1107,15 @@ def cmd_tasks_complete(env, uid, calendar=None):
             decoded = urllib.parse.unquote(href)
             encoded = urllib.parse.quote(decoded, safe="/:")
             ics_url = base_url + encoded
-            get_args = curl_basic(env) + ["-X", "GET", "-H", "Accept: text/calendar", ics_url]
-            ics_data = run_curl(get_args)
-            if isinstance(ics_data, dict) or not ics_data or "BEGIN:VCALENDAR" not in ics_data:
+            get_args = curl_base(env) + ["-X", "GET", "-H", "Accept: text/calendar", ics_url]
+            get_code, raw_ics, get_err = curl_request(get_args)
+            if get_err or get_code != 200 or not raw_ics or "BEGIN:VCALENDAR" not in raw_ics:
                 continue
-            parsed = parse_icalendar(ics_data, item_type="VTODO")
+            parsed = parse_icalendar(raw_ics, item_type="VTODO")
             if parsed.get("uid") == uid:
                 task_data = parsed
                 found_cal = cal_name
+                found_raw = raw_ics
                 break
         if task_data:
             break
@@ -908,27 +1123,35 @@ def cmd_tasks_complete(env, uid, calendar=None):
     if not task_data:
         return {"status": "error", "message": f"Task '{uid}' not found"}
 
-    # Build completed VTODO
-    new_body, _ = vtodo_from_args(
-        task_data.get("summary", ""),
-        due=task_data.get("due", ""),
-        priority=task_data.get("priority"),
-        description=task_data.get("description", ""),
-        status="COMPLETED",
-    )
-    new_body = new_body.replace(f"UID:{uid}", f"UID:{uid}", 1)
+    # Mark completed in place, keeping every other property intact.
+    updates = {
+        "STATUS": "STATUS:COMPLETED",
+        "COMPLETED": f"COMPLETED:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+    }
+    new_body = ical_replace_properties(found_raw, updates, "VTODO")
+    if new_body is None:
+        new_body, _ = vtodo_from_args(
+            task_data.get("summary", ""),
+            due=task_data.get("due", ""),
+            priority=task_data.get("priority"),
+            description=task_data.get("description", ""),
+            status="COMPLETED",
+            uid=uid,
+        )
 
     cal_url = caldav_url(env, f"{found_cal}/{uid}.ics")
-    args = curl_basic(env) + [
+    args = curl_base(env) + [
         "-X", "PUT",
         "-H", "Content-Type: text/calendar; charset=utf-8",
-        "-d", new_body,
+        "--data-binary", "@-",
         cal_url,
     ]
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode in (0, 201, 204):
-        return {"status": "success", "data": {**task_data, "status": "COMPLETED", "updated": True}}
-    return {"status": "error", "message": result.stderr or f"Complete task failed (code {result.returncode})"}
+    code, body, err = curl_request(args, input_data=new_body)
+    if err:
+        return http_error(code, err, f"Complete task '{uid}'")
+    if code not in (200, 201, 204):
+        return http_error(code, None, f"Complete task '{uid}'")
+    return {"status": "success", "data": {**task_data, "status": "COMPLETED", "updated": True}}
 
 
 def cmd_tasks_delete(env, uid, calendar=None):
@@ -942,11 +1165,26 @@ def cmd_tasks_delete(env, uid, calendar=None):
 
     for cal_name in search_cals:
         cal_url = caldav_url(env, f"{cal_name}/{uid}.ics")
-        args = curl_basic(env) + ["-X", "DELETE", cal_url]
-        result = subprocess.run(args, capture_output=True, text=True)
-        if result.returncode in (0, 204):
+        args = curl_base(env) + ["-X", "DELETE", cal_url]
+        code, body, err = curl_request(args)
+        if err:
+            continue
+        if code in (200, 204):
             return {"status": "success", "data": {"uid": uid, "deleted": True}}
     return {"status": "error", "message": f"Task '{uid}' not found in any calendar"}
+
+
+def _parse_ical_dt(value):
+    """Parse an iCalendar or human datetime string; returns datetime or None."""
+    v = (value or "").strip()
+    fmts = ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S", "%Y%m%d",
+            "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d")
+    for fmt in fmts:
+        try:
+            return datetime.strptime(v, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def cmd_calendar_list(env, calendar=None, cal_from=None, cal_to=None):
@@ -961,6 +1199,13 @@ def cmd_calendar_list(env, calendar=None, cal_from=None, cal_to=None):
         if not calendars:
             return {"status": "error", "message": f"Calendar '{calendar}' not found"}
 
+    dt_from = _parse_ical_dt(cal_from) if cal_from else None
+    dt_to = _parse_ical_dt(cal_to) if cal_to else None
+    if cal_from and dt_from is None:
+        return {"status": "error", "message": f"Unparseable --from value: {cal_from}"}
+    if cal_to and dt_to is None:
+        return {"status": "error", "message": f"Unparseable --to value: {cal_to}"}
+
     all_events = []
     base_url = env["NEXTCLOUD_URL"].rstrip("/")
 
@@ -971,13 +1216,13 @@ def cmd_calendar_list(env, calendar=None, cal_from=None, cal_to=None):
 
         # Use PROPFIND with Depth: infinity to get all .ics files
         # (REPORT method is not supported by this Nextcloud server)
-        args = curl_xml(env) + [
+        args = curl_base(env, accept="application/xml") + [
             "-X", "PROPFIND",
-            "-H", f"Depth: infinity",
+            "-H", "Depth: infinity",
             cal_url,
         ]
-        output = run_curl(args)
-        if isinstance(output, dict) and "error" in output:
+        prop_code, output, prop_err = curl_request(args, timeout=60)
+        if prop_err or prop_code != 207:
             continue
 
         # Find all .ics hrefs
@@ -992,20 +1237,16 @@ def cmd_calendar_list(env, calendar=None, cal_from=None, cal_to=None):
             encoded = urllib.parse.quote(decoded, safe="/:")
             ics_url = base_url + encoded
 
-            get_args = curl_basic(env) + [
+            get_args = curl_base(env) + [
                 "-X", "GET",
                 "-H", "Accept: text/calendar",
                 ics_url,
             ]
-            ics_data = run_curl(get_args)
-            if isinstance(ics_data, dict) or not ics_data:
+            get_code, ics_data, get_err = curl_request(get_args)
+            if get_err or get_code != 200 or not ics_data:
                 continue
             if "BEGIN:VCALENDAR" not in ics_data:
                 continue
-
-            # Extract UID from the ics data for filtering
-            uid_match = re.search(r"^UID:([^\r\n]+)", ics_data, re.MULTILINE)
-            event_uid = uid_match.group(1).strip() if uid_match else ""
 
             event_data = parse_icalendar(ics_data, item_type="VEVENT")
             if event_data:
@@ -1013,11 +1254,21 @@ def cmd_calendar_list(env, calendar=None, cal_from=None, cal_to=None):
                 event_data["href"] = href
                 all_events.append(event_data)
 
-    # Filter by date range if provided
-    if cal_from:
-        all_events = [e for e in all_events if e.get("start", "") >= cal_from]
-    if cal_to:
-        all_events = [e for e in all_events if e.get("end", "") <= cal_to]
+    # Filter by date range (compare parsed datetimes, not raw strings)
+    if dt_from is not None:
+        kept = []
+        for e in all_events:
+            ev_start = _parse_ical_dt(e.get("start", ""))
+            if ev_start is not None and ev_start >= dt_from:
+                kept.append(e)
+        all_events = kept
+    if dt_to is not None:
+        kept = []
+        for e in all_events:
+            ev_end = _parse_ical_dt(e.get("end", ""))
+            if ev_end is not None and ev_end <= dt_to:
+                kept.append(e)
+        all_events = kept
 
     return {"status": "success", "data": all_events}
 
@@ -1048,16 +1299,18 @@ def cmd_calendar_create(env, summary, start, end, calendar=None, location=None, 
     base_url = env["NEXTCLOUD_URL"].rstrip("/")
     cal_url = base_url + cal_href + "/" + uid + ".ics"
 
-    args = curl_basic(env) + [
+    args = curl_base(env) + [
         "-X", "PUT",
         "-H", "Content-Type: text/calendar; charset=utf-8",
-        "-d", vevent_body,
+        "--data-binary", "@-",
         cal_url,
     ]
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode in (0, 201, 204):
-        return {"status": "success", "data": {"uid": uid, "calendar": selected_cal.get("name", cal_href), "summary": summary, "start": start, "end": end, "created": True}}
-    return {"status": "error", "message": result.stderr or f"Create event failed (code {result.returncode})"}
+    code, body, err = curl_request(args, input_data=vevent_body)
+    if err:
+        return http_error(code, err, "Create event")
+    if code not in (200, 201, 204):
+        return http_error(code, None, "Create event")
+    return {"status": "success", "data": {"uid": uid, "calendar": selected_cal.get("name", cal_href), "summary": summary, "start": start, "end": end, "created": True}}
 
 
 def cmd_calendar_edit(env, uid, calendar=None, summary=None, start=None, end=None, location=None, description=None):
@@ -1074,6 +1327,7 @@ def cmd_calendar_edit(env, uid, calendar=None, summary=None, start=None, end=Non
 
     event_data = None
     found_cal = None
+    found_raw = None
     for cal_name in search_cals:
         cal_entry = next((c for c in calendars if c.get("name") == cal_name), None)
         if not cal_entry:
@@ -1082,13 +1336,13 @@ def cmd_calendar_edit(env, uid, calendar=None, summary=None, start=None, end=Non
         cal_url = base_url + cal_href + "/"
 
         # PROPFIND with Depth: infinity to get all .ics files
-        args = curl_xml(env) + [
+        args = curl_base(env, accept="application/xml") + [
             "-X", "PROPFIND",
             "-H", "Depth: infinity",
             cal_url,
         ]
-        output = run_curl(args)
-        if isinstance(output, dict) and "error" in output:
+        prop_code, output, prop_err = curl_request(args, timeout=60)
+        if prop_err or prop_code != 207:
             continue
 
         ics_hrefs = re.findall(r"<d:href>([^<]+\.ics)</d:href>", output)
@@ -1099,21 +1353,22 @@ def cmd_calendar_edit(env, uid, calendar=None, summary=None, start=None, end=Non
             encoded = urllib.parse.quote(decoded, safe="/:")
             ics_url = base_url + encoded
 
-            get_args = curl_basic(env) + [
+            get_args = curl_base(env) + [
                 "-X", "GET",
                 "-H", "Accept: text/calendar",
                 ics_url,
             ]
-            ics_data = run_curl(get_args)
-            if isinstance(ics_data, dict) or not ics_data:
+            get_code, raw_ics, get_err = curl_request(get_args)
+            if get_err or get_code != 200 or not raw_ics:
                 continue
-            if "BEGIN:VCALENDAR" not in ics_data:
+            if "BEGIN:VCALENDAR" not in raw_ics:
                 continue
 
-            parsed = parse_icalendar(ics_data, item_type="VEVENT")
+            parsed = parse_icalendar(raw_ics, item_type="VEVENT")
             if parsed.get("uid") == uid:
                 event_data = parsed
                 found_cal = cal_name
+                found_raw = raw_ics
                 break
         if event_data:
             break
@@ -1121,26 +1376,46 @@ def cmd_calendar_edit(env, uid, calendar=None, summary=None, start=None, end=Non
     if not event_data:
         return {"status": "error", "message": f"Event '{uid}' not found"}
 
-    ev_summary = summary if summary is not None else event_data.get("summary", "")
-    ev_start = start if start is not None else event_data.get("start", "")
-    ev_end = end if end is not None else event_data.get("end", "")
-    ev_location = location if location is not None else event_data.get("location", "")
-    ev_desc = description if description is not None else event_data.get("description", "")
-
-    tzid = env.get("NEXTCLOUD_TIMEZONE", "UTC")
-    new_body = vevent_from_args(ev_summary, ev_start, ev_end, location=ev_location, description=ev_desc, uid=uid, tzid=tzid)
+    # Update properties in place so alarms, attendees and similar metadata
+    # survive the edit; only the explicitly provided fields change.
+    updates = {}
+    if summary is not None:
+        updates["SUMMARY"] = f"SUMMARY:{ical_escape(summary)}"
+    if start is not None:
+        start_str, start_is_date = ical_datetime(start)
+        updates["DTSTART"] = f"DTSTART;VALUE=DATE:{start_str}" if start_is_date else f"DTSTART:{start_str}"
+    if end is not None:
+        end_str, end_is_date = ical_datetime(end)
+        updates["DTEND"] = f"DTEND;VALUE=DATE:{end_str}" if end_is_date else f"DTEND:{end_str}"
+    if location is not None:
+        updates["LOCATION"] = f"LOCATION:{ical_escape(location)}"
+    if description is not None:
+        updates["DESCRIPTION"] = f"DESCRIPTION:{ical_escape(description)}"
+    new_body = ical_replace_properties(found_raw, updates, "VEVENT")
+    if new_body is None:
+        # Fallback: rebuild while preserving the original UID (the UID in the
+        # body must match the request URL or the server rejects the PUT).
+        ev_summary = summary if summary is not None else event_data.get("summary", "")
+        ev_start = start if start is not None else event_data.get("start", "")
+        ev_end = end if end is not None else event_data.get("end", "")
+        ev_location = location if location is not None else event_data.get("location", "")
+        ev_desc = description if description is not None else event_data.get("description", "")
+        tzid = env.get("NEXTCLOUD_TIMEZONE", "UTC")
+        new_body = vevent_from_args(ev_summary, ev_start, ev_end, location=ev_location, description=ev_desc, uid=uid, tzid=tzid)
 
     cal_url = caldav_url(env, f"{found_cal}/{uid}.ics")
-    args = curl_basic(env) + [
+    args = curl_base(env) + [
         "-X", "PUT",
         "-H", "Content-Type: text/calendar; charset=utf-8",
-        "-d", new_body,
+        "--data-binary", "@-",
         cal_url,
     ]
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode in (0, 201, 204):
-        return {"status": "success", "data": {**event_data, "updated": True}}
-    return {"status": "error", "message": result.stderr or f"Edit event failed (code {result.returncode})"}
+    code, body, err = curl_request(args, input_data=new_body)
+    if err:
+        return http_error(code, err, f"Edit event '{uid}'")
+    if code not in (200, 201, 204):
+        return http_error(code, None, f"Edit event '{uid}'")
+    return {"status": "success", "data": {**event_data, "updated": True}}
 
 
 def cmd_calendar_delete(env, uid, calendar=None):
@@ -1154,9 +1429,11 @@ def cmd_calendar_delete(env, uid, calendar=None):
 
     for cal_name in search_cals:
         cal_url = caldav_url(env, f"{cal_name}/{uid}.ics")
-        args = curl_basic(env) + ["-X", "DELETE", cal_url]
-        result = subprocess.run(args, capture_output=True, text=True)
-        if result.returncode in (0, 204):
+        args = curl_base(env) + ["-X", "DELETE", cal_url]
+        code, body, err = curl_request(args)
+        if err:
+            continue
+        if code in (200, 204):
             return {"status": "success", "data": {"uid": uid, "deleted": True}}
     return {"status": "error", "message": f"Event '{uid}' not found in any calendar"}
 
@@ -1172,7 +1449,9 @@ def cmd_addressbooks_list(env):
         href = r.get("href", "")
         # Addressbooks are under /addressbooks/ and have displayname or specific path patterns
         if "/addressbooks/" in href:
-            name = r.get("displayname") or href.split("/")[-1].rstrip("/")
+            # href-derived fallback is percent-encoded; decode so downstream URL
+            # building (which re-encodes once) does not double-encode.
+            name = r.get("displayname") or urllib.parse.unquote(href.split("/")[-1].rstrip("/"))
             # Skip the parent /addressbooks/users/{user}/ directory itself
             if name == "users":
                 continue
@@ -1203,13 +1482,13 @@ def cmd_contacts_list(env, addressbook=None):
         # Try Depth: 1 first, fall back to infinity if no vcf files found
         vcard_hrefs = []
         for depth in ("1", "infinity"):
-            args = curl_xml(env) + [
+            args = curl_base(env, accept="application/xml") + [
                 "-X", "PROPFIND",
                 "-H", f"Depth: {depth}",
                 ab_url,
             ]
-            output = run_curl(args)
-            if isinstance(output, dict) and "error" in output:
+            prop_code, output, prop_err = curl_request(args, timeout=60)
+            if prop_err or prop_code != 207:
                 break
             # Match vcf hrefs - .vcf files or Database: prefixed vcf files
             vcard_hrefs = re.findall(r"<d:href>([^<]*(?:\.vcf|Database:[^<]*\.vcf)[^<]*)</d:href>", output)
@@ -1223,13 +1502,13 @@ def cmd_contacts_list(env, addressbook=None):
             decoded = urllib.parse.unquote(vcard_href)
             encoded = urllib.parse.quote(decoded, safe="/:")
             vcard_url = base_url + encoded
-            get_args = curl_basic(env) + [
+            get_args = curl_base(env) + [
                 "-X", "GET",
                 "-H", "Accept: text/vcard, text/x-vcard",
                 vcard_url,
             ]
-            vcard_data = run_curl(get_args)
-            if isinstance(vcard_data, dict) or not vcard_data:
+            get_code, vcard_data, get_err = curl_request(get_args)
+            if get_err or get_code != 200 or not vcard_data:
                 continue
 
             # Parse vCard - fields may have parameters like FN;X-NC-SCOPE=...:value
@@ -1301,7 +1580,8 @@ def cmd_contacts_get(env, uid, addressbook=None):
         if ab_entry:
             abooks = [(ab_entry["href"], ab_entry["name"])]
         else:
-            abooks = [(f"/remote.php/dav/addressbooks/users/{env['NEXTCLOUD_USER']}/{addressbook}/", addressbook)]
+            user = urllib.parse.quote(env["NEXTCLOUD_USER"], safe="")
+            abooks = [(f"/remote.php/dav/addressbooks/users/{user}/{_quote_path(addressbook)}/", addressbook)]
     else:
         ab_result = cmd_addressbooks_list(env)
         if ab_result.get("status") != "success":
@@ -1312,10 +1592,10 @@ def cmd_contacts_get(env, uid, addressbook=None):
 
     for ab_href, ab_name in abooks:
         # Optimized: try direct URL first (Nextcloud stores contacts as {uid}.vcf)
-        direct_url = base_url + ab_href.rstrip("/") + "/" + urllib.parse.quote(uid) + ".vcf"
-        get_args = curl_basic(env) + ["-X", "GET", "-H", "Accept: text/vcard", direct_url]
-        vcard_data = run_curl(get_args)
-        if not isinstance(vcard_data, dict) and vcard_data and "BEGIN:VCARD" in vcard_data:
+        direct_url = base_url + ab_href.rstrip("/") + "/" + urllib.parse.quote(uid, safe="") + ".vcf"
+        get_args = curl_base(env) + ["-X", "GET", "-H", "Accept: text/vcard", direct_url]
+        direct_code, vcard_data, direct_err = curl_request(get_args)
+        if not direct_err and direct_code == 200 and vcard_data and "BEGIN:VCARD" in vcard_data:
             # Found via direct URL - parse and return
             contact = {
                 "addressbook": ab_name,
@@ -1345,9 +1625,9 @@ def cmd_contacts_get(env, uid, addressbook=None):
         # Fallback: scan all vcf files via PROPFIND
         ab_url = base_url + ab_href
         for depth in ("1", "infinity"):
-            args = curl_xml(env) + ["-X", "PROPFIND", "-H", f"Depth: {depth}", ab_url]
-            output = run_curl(args)
-            if isinstance(output, dict) and "error" in output:
+            args = curl_base(env, accept="application/xml") + ["-X", "PROPFIND", "-H", f"Depth: {depth}", ab_url]
+            prop_code, output, prop_err = curl_request(args, timeout=60)
+            if prop_err or prop_code != 207:
                 break
 
             vcard_hrefs = re.findall(r"<d:href>([^<]*(?:\.vcf|Database:[^<]*\.vcf)[^<]*)</d:href>", output)
@@ -1359,9 +1639,9 @@ def cmd_contacts_get(env, uid, addressbook=None):
             decoded = urllib.parse.unquote(vcard_href)
             encoded = urllib.parse.quote(decoded, safe="/:")
             vcard_url = base_url + encoded
-            get_args = curl_basic(env) + ["-X", "GET", "-H", "Accept: text/vcard", vcard_url]
-            vcard_data = run_curl(get_args)
-            if isinstance(vcard_data, dict) or not vcard_data or "BEGIN:VCARD" not in vcard_data:
+            get_args = curl_base(env) + ["-X", "GET", "-H", "Accept: text/vcard", vcard_url]
+            get_code, vcard_data, get_err = curl_request(get_args)
+            if get_err or get_code != 200 or not vcard_data or "BEGIN:VCARD" not in vcard_data:
                 continue
             uid_match = re.search(r"^UID:([^\r\n]+)", vcard_data, re.MULTILINE)
             file_uid = uid_match.group(1).strip() if uid_match else ""
@@ -1407,20 +1687,20 @@ def cmd_contacts_create(env, name, addressbook=None, email=None, phone=None, org
 
     uid = f"hermes-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{os.urandom(4).hex()}"
     vcard = vcard_from_args(name, email=email, phone=phone, organization=organization, title=title, note=note)
-    # Replace FN with the actual name to ensure it's set
-    vcard = vcard.replace("FN:" + name, f"FN:{name}", 1)
 
     contact_url = carddav_url(env, f"{addressbook}/{uid}.vcf")
-    args = curl_basic(env) + [
+    args = curl_base(env) + [
         "-X", "PUT",
         "-H", "Content-Type: text/vcard; charset=utf-8",
-        "-d", vcard,
+        "--data-binary", "@-",
         contact_url,
     ]
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode in (0, 201, 204):
-        return {"status": "success", "data": {"uid": uid, "addressbook": addressbook, "fullname": name, "created": True}}
-    return {"status": "error", "message": result.stderr or f"Create contact failed (code {result.returncode})"}
+    code, body, err = curl_request(args, input_data=vcard)
+    if err:
+        return http_error(code, err, "Create contact")
+    if code not in (200, 201, 204):
+        return http_error(code, None, "Create contact")
+    return {"status": "success", "data": {"uid": uid, "addressbook": addressbook, "fullname": name, "created": True}}
 
 
 def cmd_contacts_edit(env, uid, addressbook=None, name=None, email=None, phone=None, organization=None, title=None, note=None):
@@ -1457,16 +1737,18 @@ def cmd_contacts_edit(env, uid, addressbook=None, name=None, email=None, phone=N
         contact_url = base_url + ab_href + urllib.parse.quote(uid) + ".vcf"
     else:
         contact_url = carddav_url(env, f"{ab_name}/{uid}.vcf")
-    args = curl_basic(env) + [
+    args = curl_base(env) + [
         "-X", "PUT",
         "-H", "Content-Type: text/vcard; charset=utf-8",
-        "-d", vcard,
+        "--data-binary", "@-",
         contact_url,
     ]
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode in (0, 201, 204):
-        return {"status": "success", "data": {**contact, "updated": True}}
-    return {"status": "error", "message": result.stderr or f"Edit contact failed (code {result.returncode})"}
+    code, body, err = curl_request(args, input_data=vcard)
+    if err:
+        return http_error(code, err, f"Edit contact '{uid}'")
+    if code not in (200, 201, 204):
+        return http_error(code, None, f"Edit contact '{uid}'")
+    return {"status": "success", "data": {**contact, "updated": True}}
 
 
 def cmd_contacts_delete(env, uid, addressbook=None):
@@ -1481,9 +1763,11 @@ def cmd_contacts_delete(env, uid, addressbook=None):
 
     for ab_name in abooks:
         contact_url = carddav_url(env, f"{ab_name}/{uid}.vcf")
-        args = curl_basic(env) + ["-X", "DELETE", contact_url]
-        result = subprocess.run(args, capture_output=True, text=True)
-        if result.returncode in (0, 204):
+        args = curl_base(env) + ["-X", "DELETE", contact_url]
+        code, body, err = curl_request(args)
+        if err:
+            continue
+        if code in (200, 204):
             return {"status": "success", "data": {"uid": uid, "deleted": True}}
     return {"status": "error", "message": f"Contact '{uid}' not found"}
 
@@ -1491,6 +1775,20 @@ def cmd_contacts_delete(env, uid, addressbook=None):
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def _resolve_upload(env, args):
+    """Resolve upload content from --content or --content-file ('-' = stdin)."""
+    content = args.content
+    if getattr(args, "content_file", None):
+        if args.content_file == "-":
+            content = sys.stdin.read()
+        else:
+            with open(args.content_file, "r") as f:
+                content = f.read()
+    if content is None:
+        return {"status": "error", "message": "Provide --content or --content-file ('-' for stdin)"}
+    return cmd_files_upload(env, args.path, content)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Nextcloud API for Hermes Agent")
@@ -1514,8 +1812,11 @@ def main():
 
     p = files_sub.add_parser("upload", help="Upload file")
     p.add_argument("--path", required=True)
-    p.add_argument("--content", required=True)
-    p.set_defaults(func=lambda args: cmd_files_upload(env, args.path, args.content))
+    p.add_argument("--content", default=None, help="File content (small payloads only)")
+    p.add_argument("--content-file", default=None,
+                   help="Read content from a file ('-' reads stdin; recommended for "
+                        "large or sensitive content — keeps it out of the process list)")
+    p.set_defaults(func=lambda args: _resolve_upload(env, args))
 
     p = files_sub.add_parser("mkdir", help="Create directory")
     p.add_argument("--path", required=True)
@@ -1697,7 +1998,7 @@ def main():
         return
 
     # Load env
-    env = load_env()
+    env = load_env(args.env_file)
 
     # Special case: check/setup commands don't need credentials yet
     if args.command == "check":
