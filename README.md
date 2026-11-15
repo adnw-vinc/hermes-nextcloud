@@ -30,7 +30,7 @@ The skill communicates over HTTPS only. No desktop client or third-party sync se
 
 **Contacts:** Browse and search your address books, view contact cards, export as vCard.
 
-**Setup:** Guided setup walks you through configuring your URL, username, and app password. Nothing is stored in plain text.
+**Setup:** Guided setup walks you through configuring your URL, username, and app password. Credentials are stored in `~/.hermes/nextcloud.env` with owner-only permissions (0600), and are never passed on the command line of subprocesses (a 0600 curl config file is used instead, so the app password does not leak via the process list).
 
 ## Requirements
 

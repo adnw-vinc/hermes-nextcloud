@@ -87,7 +87,7 @@ $NC files list --path "/Documents"
 $NC files list  # root folder
 ```
 
-Returns: `{"status": "success", "data": [{"path": "...", "type": "file|dir", "size": N, "mtime": "ISO8601"}]}`
+Returns: `{"status": "success", "data": [{"path": "...", "type": "file|dir", "size": N, "last_modified": "HTTP-date", "etag": "..."}]}`
 
 ### Get file content
 
@@ -99,6 +99,14 @@ $NC files get --path "/Documents/notes.md"
 
 ```bash
 $NC files upload --path "/Documents/new-file.txt" --content "File content here"
+```
+
+For large or sensitive content, pass it via stdin or a file instead of argv
+(argv content is visible in the process list and capped at ~128 KiB):
+
+```bash
+$NC files upload --path "/Documents/report.pdf.txt" --content-file - < report.txt
+$NC files upload --path "/Documents/notes.md" --content-file notes.md
 ```
 
 ### Create directory
@@ -126,6 +134,10 @@ $NC files move --src "/Documents/old-name.txt" --dst "/Documents/new-name.txt"
 ```bash
 $NC files search --query "budget"
 ```
+
+> Note: search uses a `Depth: infinity` PROPFIND, which Nextcloud rejects with
+> HTTP 400 unless `dav.propfind.depth_infinity` is enabled in `config.php`.
+> On default instances, browse directories with `files list` instead.
 
 ---
 
@@ -229,8 +241,6 @@ $NC calendar list --from "2026-07-01T00:00:00Z" --to "2026-07-07T23:59:59Z"
 $NC calendar list --calendar "Work"
 ```
 
-Default range: next 7 days.
-
 ### Create event
 
 ```bash
@@ -329,12 +339,14 @@ Credentials are stored in `~/.hermes/nextcloud.env` by the setup script. The ski
 ## Error Handling
 
 | HTTP Code | Meaning | Common Cause |
-|-----------|---------|-------------|
+|-----------|---------|--------------|
 | 401 | Unauthorized | Invalid or expired App Password |
 | 403 | Forbidden | User lacks permission for this resource |
 | 404 | Not Found | Wrong path, or Notes app not installed |
-| 409 | Conflict | Destination already exists (on move/rename) |
-| 424 | Method Not Allowed | Feature not supported by server (e.g. Notes API) |
+| 405 | Method Not Allowed | Resource already exists (e.g. MKCOL on an existing directory) |
+| 409 | Conflict | Parent collection missing (e.g. upload into a non-existent directory) |
+| 412 | Precondition Failed | ETag mismatch (concurrent edit) or destination exists (MOVE) |
+| 424 | Failed Dependency | Feature not supported by server (e.g. Notes API) |
 
 ---
 
